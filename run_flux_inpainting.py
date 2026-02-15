@@ -16,18 +16,32 @@ def main():
     pipe.enable_model_cpu_offload()
 
     # Load image
-    image_path = "data/images/table.jpg"
+    image_path = "data/images/statue_IMG_2730.jpg"
     image = load_image(image_path)
-    
-    # Generate mask (center box)
     width, height = image.size
-    box_size = min(width, height) // 4
-    center_x, center_y = width // 2, height // 2
-    box_coords = (center_x - box_size, center_y - box_size, center_x + box_size, center_y + box_size)
-    mask = generate_mask(image, box_coords)
+    
+    # Load mask
+    mask_path = "data/images/statue_mask.png"
+    try:
+        mask = load_image(mask_path)
+        print(f"Loaded mask from {mask_path}")
+        
+        # Dilate mask by ~10 pixels
+        from PIL import ImageFilter
+        # MaxFilter with size 21 corresponds to a radius of 10 pixels (center + 10 neighbors on each side)
+        mask = mask.filter(ImageFilter.MaxFilter(21)) 
+        print("Applied 10px dilation to mask.")
+        
+    except Exception:
+        print(f"Mask not found at {mask_path}, generating fallback box mask...")
+        # Generate mask (center box) as fallback
+        box_size = min(width, height) // 4
+        center_x, center_y = width // 2, height // 2
+        box_coords = (center_x - box_size, center_y - box_size, center_x + box_size, center_y + box_size)
+        mask = generate_mask(image, box_coords)
 
     # Prompt
-    prompt = "a vase of flowers on the table"
+    prompt = "a cute corgi"
 
     # Run inference
     image = pipe(
@@ -41,6 +55,7 @@ def main():
         max_sequence_length=512,
         generator=torch.Generator("cpu").manual_seed(0)
     ).images[0]
+
 
     # Save output
     output_path = "output/flux_inpainting_output.png"
