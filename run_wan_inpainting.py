@@ -55,7 +55,14 @@ def save_video(tensor, output_path, fps=30):
     out.release()
     print(f"Saved video to {output_path}")
 
+import argparse
+
 def main():
+    parser = argparse.ArgumentParser(description="Run Wan Video Inpainting")
+    parser.add_argument("--strength", type=float, default=1.0, help="Inpainting strength (0.0-1.0)")
+    parser.add_argument("--output", type=str, default="output/wan_inpainting_output.mp4", help="Output video path")
+    args = parser.parse_args()
+
     device_id = 0
     checkpoint_dir = "Wan2.1-T2V-1.3B"
     
@@ -65,7 +72,7 @@ def main():
     # Input paths
     input_video_path = "data/video_input/wan_input.mp4"
     mask_video_path = "data/video_input/wan_mask.mp4"
-    output_path = "output/wan_inpainting_output.mp4"
+    output_path = args.output
     
     # Load videos
     input_frames = load_video_frames(input_video_path)
@@ -87,13 +94,13 @@ def main():
     prompt = "a cute corgi, jumping and running, barking, 8k quality, detailed"
     width, height = input_frames[0].size
     
-    print("Running inpainting...")
+    print(f"Running inpainting with strength {args.strength}...")
     generated_video = wan_inpaint.generate_inpaint(
         input_prompt=prompt,
         init_video=input_frames,
         mask=mask_frames,
         size=(width, height),
-        strength=1.0, # Full inpainting in masked areas
+        strength=args.strength, 
         sampling_steps=50,
         guide_scale=6.0,
         seed=42,

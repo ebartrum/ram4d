@@ -65,13 +65,14 @@ def main():
     black_mask = Image.new("L", (width, height), 0)
     
     for i in range(total_frames):
-        if i == 0 or i == total_frames - 1:
-            # Frame 0 and 80: Flux output, unmasked (keep content)
-            video_frames.append(flux_img)
+        # Use flux_img for ALL frames as requested
+        video_frames.append(flux_img)
+        
+        if i < 4 or i == total_frames - 1:
+            # Frames 0-3 & 80: Keep everything (Black mask)
             mask_frames.append(black_mask)
         else:
-            # Frames 1-79: Statue image, masked (inpaint this)
-            video_frames.append(statue_img)
+            # Frames 4-79: Inpaint masked area
             mask_frames.append(mask_img)
 
     # Save input video
