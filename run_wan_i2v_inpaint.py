@@ -57,31 +57,7 @@ def prepare_mask_latents(mask, vae, device, param_dtype):
     
     return final_masks
 
-import cv2
-
-def preprocess_mask_image(mask_path, dilation_pixels=30):
-    print(f"Loading mask: {mask_path}")
-    mask_img = Image.open(mask_path).convert("L")
-    
-    # Hole filling
-    # Convert to numpy
-    mask_np = np.array(mask_img)
-    # Binarize (assuming mask is 0 or 255, but use threshold to be safe)
-    _, mask_thresh = cv2.threshold(mask_np, 127, 255, cv2.THRESH_BINARY)
-    # Find external contours and fill them
-    contours, _ = cv2.findContours(mask_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    print(f"Filled {len(contours)} holes/contours in mask.")
-    cv2.drawContours(mask_thresh, contours, -1, 255, -1)
-    # Convert back to PIL
-    mask_img = Image.fromarray(mask_thresh)
-    
-    # Dilation
-    # MaxFilter size approx 2 * radius + 1
-    filter_size = 2 * dilation_pixels + 1
-    from PIL import ImageFilter
-    print(f"Applying {dilation_pixels}px dilation to mask (MaxFilter {filter_size})...")
-    mask_img = mask_img.filter(ImageFilter.MaxFilter(filter_size))
-    return mask_img
+from utils import preprocess_mask_image
 
 def main():
     device_id = 0
@@ -97,7 +73,7 @@ def main():
     print(f"Model downloaded to {checkpoint_dir}")
     
     # Inputs
-    image_path = "output/flux_inpainting_output.png"
+    image_path = "data/images/flux_inpainting_output.png"
     mask_path = "data/images/statue_mask.png" 
     
     print(f"Loading image: {image_path}")
