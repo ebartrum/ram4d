@@ -65,6 +65,9 @@ def main():
     parser.add_argument("--mask", type=str, default="data/images/statue_mask.png", help="Path to input mask")
     parser.add_argument("--prompt_path", type=str, default="data/captions/corgi_video.txt", help="Path to text prompt")
     parser.add_argument("--dilation", type=int, default=30, help="Mask dilation in pixels")
+    parser.add_argument("--frame_num", type=int, default=81, help="Number of frames to generate")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--output_file", type=str, default="wan_i2v_inpaint_14b.mp4", help="Output filename (saved in output/ dir)")
     args = parser.parse_args()
 
     device_id = 0
@@ -134,7 +137,7 @@ def main():
     keep_mask = 1.0 - mask_tensor # 1=Keep (Background), 0=Change (Subject) (if mask was white for subject)
     
     # Create video tensors (repeated)
-    frame_num = 81
+    frame_num = args.frame_num
     init_video_tensor = first_frame.unsqueeze(1).repeat(1, frame_num, 1, 1).unsqueeze(0) # [1, 3, F, H, W]
     
     # Mask tensor shape for prepare_mask_latents matches WanT2VInpaint [B, F, C, H, W]
@@ -172,7 +175,7 @@ def main():
     lat_w = round(np.sqrt(max_area / aspect_ratio) // vae_stride[2] // patch_size[2] * patch_size[2])
     
     # ... (Seed, Noise, etc.) ...
-    seed = 42
+    seed = args.seed
     seed_g = torch.Generator(device=device)
     seed_g.manual_seed(seed)
     
@@ -307,7 +310,7 @@ def main():
     # Save
     cache_video(
         tensor=videos[0][None],
-        save_file="output/wan_i2v_inpaint_14b.mp4",
+        save_file=os.path.join("output", args.output_file),
         fps=16,
         nrow=1,
         normalize=True,
