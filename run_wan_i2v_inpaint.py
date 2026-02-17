@@ -61,7 +61,7 @@ def prepare_mask_latents(mask, vae, device, param_dtype):
 
 def main():
     parser = argparse.ArgumentParser(description="Wan I2V Inpainting")
-    parser.add_argument("--image", type=str, default="data/images/flux_inpainting_output.png", help="Path to input image")
+    parser.add_argument("--image", type=str, default="data/images/flux_inpainted_corgi.png", help="Path to input image")
     parser.add_argument("--mask", type=str, default="data/images/statue_mask.png", help="Path to input mask")
     parser.add_argument("--prompt_path", type=str, default="data/captions/corgi_video.txt", help="Path to text prompt")
     parser.add_argument("--dilation", type=int, default=30, help="Mask dilation in pixels")
