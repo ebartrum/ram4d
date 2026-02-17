@@ -7,7 +7,10 @@ model = LangSAM()
 image_path = "data/images/flux_inpainted_corgi.png"
 print(f"Loading image: {image_path}")
 image_pil = Image.open(image_path).convert("RGB")
-text_prompt = "corgi"
+
+prompt_path = "data/captions/corgi_segmentation.txt"
+with open(prompt_path, "r") as f:
+    text_prompt = f.read().strip()
 
 print(f"Running prediction for prompt: '{text_prompt}'")
 results = model.predict([image_pil], [text_prompt])
