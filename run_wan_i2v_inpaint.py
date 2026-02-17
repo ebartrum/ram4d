@@ -11,8 +11,8 @@ from huggingface_hub import snapshot_download
 import numpy as np
 import torchvision.transforms.functional as TF
 from contextlib import contextmanager
-
-# Add official_wan_repo to path so we can import wan
+import argparse
+from utils import preprocess_mask_image
 sys.path.insert(0, os.path.abspath("official_wan_repo"))
 
 import wan
@@ -57,9 +57,16 @@ def prepare_mask_latents(mask, vae, device, param_dtype):
     
     return final_masks
 
-from utils import preprocess_mask_image
+
 
 def main():
+    parser = argparse.ArgumentParser(description="Wan I2V Inpainting")
+    parser.add_argument("--image", type=str, default="data/images/flux_inpainting_output.png", help="Path to input image")
+    parser.add_argument("--mask", type=str, default="data/images/statue_mask.png", help="Path to input mask")
+    parser.add_argument("--prompt", type=str, default="a cute corgi, jumping and running, barking, 8k quality, detailed", help="Text prompt")
+    parser.add_argument("--dilation", type=int, default=30, help="Mask dilation in pixels")
+    args = parser.parse_args()
+
     device_id = 0
     rank = 0
     device = torch.device(f"cuda:{device_id}")
@@ -73,18 +80,18 @@ def main():
     print(f"Model downloaded to {checkpoint_dir}")
     
     # Inputs
-    image_path = "data/images/flux_inpainting_output.png"
-    mask_path = "data/images/statue_mask.png" 
+    image_path = args.image
+    mask_path = args.mask
     
     print(f"Loading image: {image_path}")
     img = Image.open(image_path).convert("RGB")
     
     # Load and preprocess mask
-    mask_img = preprocess_mask_image(mask_path, dilation_pixels=30)
+    mask_img = preprocess_mask_image(mask_path, dilation_pixels=args.dilation)
     mask_img.save("output/debug_wan_mask_preprocessed.png")
     print("Saved preprocessed mask to output/debug_wan_mask_preprocessed.png")
     
-    prompt = "a cute corgi, jumping and running, barking, 8k quality, detailed"
+    prompt = args.prompt
     
     # Initialize WanI2V
     cfg = WAN_CONFIGS[task]
