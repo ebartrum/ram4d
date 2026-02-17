@@ -63,7 +63,7 @@ def main():
     parser = argparse.ArgumentParser(description="Wan I2V Inpainting")
     parser.add_argument("--image", type=str, default="data/images/flux_inpainting_output.png", help="Path to input image")
     parser.add_argument("--mask", type=str, default="data/images/statue_mask.png", help="Path to input mask")
-    parser.add_argument("--prompt", type=str, default="a cute corgi, jumping and running, barking, 8k quality, detailed", help="Text prompt")
+    parser.add_argument("--prompt_path", type=str, default="data/captions/corgi_video.txt", help="Path to text prompt")
     parser.add_argument("--dilation", type=int, default=30, help="Mask dilation in pixels")
     args = parser.parse_args()
 
@@ -91,7 +91,10 @@ def main():
     mask_img.save("output/debug_wan_mask_preprocessed.png")
     print("Saved preprocessed mask to output/debug_wan_mask_preprocessed.png")
     
-    prompt = args.prompt
+    
+    print(f"Reading prompt from file: {args.prompt_path}")
+    with open(args.prompt_path, "r") as f:
+        prompt = f.read().strip()
     
     # Initialize WanI2V
     cfg = WAN_CONFIGS[task]
