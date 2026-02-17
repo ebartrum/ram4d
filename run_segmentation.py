@@ -1,4 +1,4 @@
-
+import argparse
 import torch
 from PIL import Image
 import numpy as np
@@ -110,9 +110,15 @@ def run_inference(image_path, prompt, output_path):
     print(f"Mask saved to {output_path}")
 
 if __name__ == "__main__":
-    image_path = "data/images/statue_IMG_2730.jpg"
-    prompt = "a photo of a statue" # OWLv2 often performs better with "a photo of a X"
-    output_path = "data/images/statue_mask.png"
+    parser = argparse.ArgumentParser(description="Run OWLv2 + SAM2 segmentation")
+    parser.add_argument("--image", type=str, default="data/images/statue_IMG_2730.jpg", help="Path to input image")
+    parser.add_argument("--prompt", type=str, default="a photo of a statue", help="Text prompt for OWLv2")
+    parser.add_argument("--output", type=str, default="data/images/statue_mask.png", help="Path to save output mask")
+    args = parser.parse_args()
+    
+    image_path = args.image
+    prompt = args.prompt
+    output_path = args.output
     
     try:
         run_inference(image_path, prompt, output_path)
