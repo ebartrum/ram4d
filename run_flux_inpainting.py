@@ -1,8 +1,10 @@
 
 import torch
-from diffusers import FluxFillPipeline
+from diffusers import FluxFillPipeline, FluxInpaintPipeline, StableDiffusionXLInpaintPipeline
 from diffusers.utils import load_image
 from PIL import Image, ImageDraw
+import argparse
+import os
 
 def generate_mask(image, box_coords):
     mask = Image.new("L", image.size, 0)
@@ -10,24 +12,47 @@ def generate_mask(image, box_coords):
     draw.rectangle(box_coords, fill=255)
     return mask
 
-import argparse
-import os
-
 def main():
-    parser = argparse.ArgumentParser(description="Run Flux Inpainting.")
+    parser = argparse.ArgumentParser(description="Run Inpainting with Flux or SDXL.")
     parser.add_argument("--image_path", type=str, default="data/images/statue_IMG_2730.jpg", help="Path to input image")
     parser.add_argument("--mask_path", type=str, default="data/images/statue_mask.png", help="Path to mask image")
     parser.add_argument("--prompt_path", type=str, default="data/captions/plinth.txt", help="Path to prompt text file")
     parser.add_argument("--output_path", type=str, default="output/flux_inpainting_output.png", help="Path to save output image")
     parser.add_argument("--dilation", type=int, default=10, help="Mask dilation radius in pixels")
-    parser.add_argument("--guidance_scale", type=int, default=30, help="Guidance scale")
+    parser.add_argument("--guidance_scale", type=float, default=30.0, help="Guidance scale")
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps")
-    parser.add_argument("--max_sequence_length", type=int, default=512, help="Maximum sequence length")
+    parser.add_argument("--max_sequence_length", type=int, default=512, help="Maximum sequence length (Flux only)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--model_type", type=str, default="flux_fill", choices=["flux_fill", "flux_inpaint", "sdxl_inpaint"], help="Model type to use")
+    
+    # Deprecated/Alias arg for backward compatibility during session
+    parser.add_argument("--use_regular_weights", action="store_true", help="Deprecated: use --model_type flux_inpaint instead")
+    
     args = parser.parse_args()
+    
+    # Handle legacy flag
+    if args.use_regular_weights:
+        args.model_type = "flux_inpaint"
 
     # Load the pipeline
-    pipe = FluxFillPipeline.from_pretrained("black-forest-labs/FLUX.1-Fill-dev", torch_dtype=torch.bfloat16)
+    if args.model_type == "flux_inpaint":
+        print("Using FluxInpaintPipeline with black-forest-labs/FLUX.1-dev")
+        pipe = FluxInpaintPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16)
+        if args.guidance_scale == 30.0:
+             print("Warning: Guidance scale 30.0 is high for regular Flux. Consider using --guidance_scale 3.5")
+    elif args.model_type == "sdxl_inpaint":
+        print("Using StableDiffusionXLInpaintPipeline with diffusers/stable-diffusion-xl-1.0-inpainting-0.1")
+        pipe = StableDiffusionXLInpaintPipeline.from_pretrained("diffusers/stable-diffusion-xl-1.0-inpainting-0.1", torch_dtype=torch.float16, use_safetensors=True)
+        if args.guidance_scale == 30.0:
+            # Revert to a reasonable default for SDXL if command line arg wasn't explicit (assuming 30 is default from argparse)
+            # However, we can't easily know if user set it or if it's default. 
+            # But 30 is definitely too high for SDXL.
+            print("Warning: Guidance scale 30.0 is high for SDXL. Using 7.5 instead.")
+            args.guidance_scale = 7.5
+    else: # flux_fill
+        print("Using FluxFillPipeline with black-forest-labs/FLUX.1-Fill-dev")
+        pipe = FluxFillPipeline.from_pretrained("black-forest-labs/FLUX.1-Fill-dev", torch_dtype=torch.bfloat16)
+    
     pipe.enable_model_cpu_offload()
 
     # Load image
@@ -62,17 +87,46 @@ def main():
     print(f"Loaded prompt from {args.prompt_path}: '{prompt}'")
 
     # Run inference
-    image = pipe(
-        prompt=prompt,
-        image=image,
-        mask_image=mask,
-        height=height,
-        width=width,
-        guidance_scale=args.guidance_scale,
-        num_inference_steps=args.num_inference_steps,
-        max_sequence_length=args.max_sequence_length,
-        generator=torch.Generator("cpu").manual_seed(args.seed)
-    ).images[0]
+    kwargs = {
+        "prompt": prompt,
+        "image": image,
+        "mask_image": mask,
+        "guidance_scale": args.guidance_scale,
+        "num_inference_steps": args.num_inference_steps,
+        "generator": torch.Generator("cpu").manual_seed(args.seed)
+    }
+    
+    if args.model_type in ["flux_fill", "flux_inpaint"]:
+        kwargs["height"] = height
+        kwargs["width"] = width
+        kwargs["max_sequence_length"] = args.max_sequence_length
+    else:
+        # SDXL requires dimensions divisible by 8
+        # Resize if necessary
+        new_width = width - (width % 8)
+        new_height = height - (height % 8)
+        
+        if new_width != width or new_height != height:
+            print(f"Resizing inputs from ({width}, {height}) to ({new_width}, {new_height}) for SDXL compatibility.")
+            kwargs["image"] = image.resize((new_width, new_height), Image.LANCZOS)
+            kwargs["mask_image"] = mask.resize((new_width, new_height), Image.NEAREST)
+            kwargs["width"] = new_width
+            kwargs["height"] = new_height
+        else:
+             kwargs["height"] = height
+             kwargs["width"] = width
+        
+        # SDXL Inpaint pipeline call signature: prompt, image, mask_image, height, width, etc.
+        # SDXL doesn't use max_sequence_length
+
+    image = pipe(**kwargs).images[0]
+    
+    # If we resized for SDXL, optionally resize back to original?
+    # For now, let's keep it simple and just save the output. 
+    # If specific resolution is strictly required, we can resize back.
+    if args.model_type == "sdxl_inpaint" and (image.width != width or image.height != height):
+         print(f"Resizing output back to original dimensions ({width}, {height}).")
+         image = image.resize((width, height), Image.LANCZOS)
 
 
     # Save output
