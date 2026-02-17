@@ -22,6 +22,14 @@ def preprocess_mask_image(mask_path, dilation_pixels=30):
     mask_img = Image.fromarray(mask_thresh)
     
     # Dilation
+    # Optimization for large dilation (no-mask condition)
+    if dilation_pixels >= 256:
+        print(f"Large dilation ({dilation_pixels}px) requested. Checking if mask is non-empty...")
+        if np.max(mask_thresh) > 0:
+            print("Mask is non-empty. Setting mask to full white (full generation).")
+            mask_img = Image.new("L", mask_img.size, 255)
+            return mask_img
+            
     # MaxFilter size approx 2 * radius + 1
     filter_size = 2 * dilation_pixels + 1
     
