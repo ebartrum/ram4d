@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--guide_scale", type=float, default=5.0, help="Classifier free guidance scale")
     parser.add_argument("--log_frequency", type=int, default=10, help="Frequency of logging/saving debug artifacts (in steps)")
     parser.add_argument("--mask_method", type=str, default="attention", choices=["attention", "sam2"], help="Method for mask estimation: 'attention' or 'sam2'")
+    parser.add_argument("--mask_dilation", type=int, default=0, help="Dilation kernel size for mask (odd number). 0 to disable.")
     args = parser.parse_args()
 
     # Setup output directories
@@ -474,15 +475,42 @@ def main():
                      sorted_frames = sorted(video_segments.keys())
                      mask_stack = torch.stack([video_segments[f] for f in sorted_frames], dim=0) # [F_frames, 1, H, W]
                      
-                     # Resize to Latent
-                     # [F_frames, 1, H, W] -> [1, 1, F_frames, H, W] for interpolate
-                     mask_stack = mask_stack.permute(1, 0, 2, 3).unsqueeze(0)
+                     # 1. Dilate in Pixel Space (to avoid shrinking)
+                     # Using MaxPool2d with stride 1 is equivalent to Dilation
+                     if args.mask_dilation > 0:
+                         dilation_kernel = args.mask_dilation
+                         # Ensure odd
+                         if dilation_kernel % 2 == 0:
+                             dilation_kernel += 1
+                         
+                         padding = dilation_kernel // 2
+                         
+                         # Reshape for spatial pooling: [F, 1, H, W]
+                         mask_stack_dilated = torch.nn.functional.max_pool2d(
+                             mask_stack,
+                             kernel_size=dilation_kernel,
+                             stride=1,
+                             padding=padding
+                         )
+                     else:
+                         mask_stack_dilated = mask_stack
                      
-                     mask_lat = torch.nn.functional.interpolate(
-                          mask_stack,
-                          size=(latent.shape[1], latent.shape[2], latent.shape[3]),
-                          mode='nearest'
+                     # 2. Resize to Latent Space using Max Pooling
+                     # We want to preserve "Any Corgi" -> "All Corgi Latent"
+                     # Latent spatial stride is 8. Temporal stride is 4.
+                     # mask_stack: [F, 1, H, W]
+                     # Target: [1, 1, F_lat, H_lat, W_lat]
+                     
+                     # Use adaptive_max_pool3d to handle the exact dimensions safely
+                     mask_stack_dilated = mask_stack_dilated.permute(1, 0, 2, 3).unsqueeze(0) # [1, 1, F, H, W]
+                     
+                     mask_lat = torch.nn.functional.adaptive_max_pool3d(
+                          mask_stack_dilated,
+                          output_size=(latent.shape[1], latent.shape[2], latent.shape[3])
                      )
+                     
+                     # Ensure binary (adaptive max pool might interpolate if not careful? No, max pool selects max.)
+                     mask_lat = (mask_lat > 0.5).float()
                      
                      final_mask = mask_lat.to(device)
                      # Expand channels [1, 16, F, H, W]
