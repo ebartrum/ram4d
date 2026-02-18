@@ -22,6 +22,10 @@ from wan.utils.utils import cache_video
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 # Import from the attention module where we added the hook
 from wan.modules.attention import ATTENTION_STORE, capture_attention
+from taehv import WanCompatibleTAEHV
+from sam2.build_sam import build_sam2_video_predictor
+import shutil
+import cv2
 
 def main():
     parser = argparse.ArgumentParser(description="Wan Corgi Attention Experiment")
@@ -34,6 +38,7 @@ def main():
     parser.add_argument("--sampling_steps", type=int, default=50, help="Number of sampling steps")
     parser.add_argument("--guide_scale", type=float, default=5.0, help="Classifier free guidance scale")
     parser.add_argument("--log_frequency", type=int, default=10, help="Frequency of logging/saving debug artifacts (in steps)")
+    parser.add_argument("--mask_method", type=str, default="attention", choices=["attention", "sam2"], help="Method for mask estimation: 'attention' or 'sam2'")
     args = parser.parse_args()
 
     # Setup output directories
@@ -215,6 +220,43 @@ def main():
     arg_c = {'context': [context[0]], 'clip_fea': clip_context, 'seq_len': max_seq_len, 'y': [y]}
     arg_null = {'context': context_null, 'clip_fea': clip_context, 'seq_len': max_seq_len, 'y': [y]}
     
+    # ------------------------------------------------------------------
+    # Initialize SAM2 and TinyVAE if needed
+    # ------------------------------------------------------------------
+    sam2_predictor = None
+    tiny_vae = None
+    sam2_inference_state = None
+    initial_mask_binary = None
+
+    if args.mask_method == "sam2":
+        print("Initializing SAM2 and TinyVAE...")
+        # TinyVAE
+        tiny_vae_path = "checkpoints/taew2_1.pth"
+        if not os.path.exists(tiny_vae_path):
+             raise FileNotFoundError(f"TinyVAE checkpoint not found at {tiny_vae_path}")
+        tiny_vae = WanCompatibleTAEHV(checkpoint_path=tiny_vae_path).to(device).eval()
+        
+        # SAM2
+        sam2_checkpoint = "checkpoints/sam2_hiera_tiny.pt"
+        sam2_config = "sam2_hiera_t.yaml"
+        if not os.path.exists(sam2_checkpoint):
+             raise FileNotFoundError(f"SAM2 checkpoint not found at {sam2_checkpoint}")
+        sam2_predictor = build_sam2_video_predictor(sam2_config, sam2_checkpoint)
+        
+        # Load Initial Mask
+        mask_path = "data/images/corgi_mask.png"
+        if not os.path.exists(mask_path):
+             raise FileNotFoundError(f"Initial mask not found at {mask_path}")
+        
+        # Prepare initial mask
+        # SAM2 expects numpy array
+        # Resize to 512x512 (Video resolution)
+        mask_img = Image.open(mask_path).convert("L")
+        mask_img = mask_img.resize((512, 512), Image.NEAREST)
+        mask_np = np.array(mask_img)
+        initial_mask_binary = (mask_np > 128).astype(np.float32)
+        print(f"Loaded initial mask from {mask_path}")
+
     wan_i2v.model.to(device)
     
     print("Starting generation...")
@@ -230,7 +272,10 @@ def main():
             
             # Predict with Attention Capture on Cond path
             wan_i2v.model.to(device)
-            with capture_attention():
+            if args.mask_method == "attention":
+                with capture_attention():
+                    noise_pred_cond = wan_i2v.model([latent.to(device)], t=torch.stack([t]).to(device), **arg_c)[0]
+            else:
                 noise_pred_cond = wan_i2v.model([latent.to(device)], t=torch.stack([t]).to(device), **arg_c)[0]
             
             # Get Uncond (no need to capture)
@@ -281,9 +326,11 @@ def main():
             latent_next = temp_x0.squeeze(0)
             
             # --------------------------------------------------------------
-            # Extract Attention Mask
+            # Extract Attention Mask / SAM2 Mask
             # --------------------------------------------------------------
-            if "weights" in ATTENTION_STORE:
+            final_mask = torch.zeros_like(latent).to(device)
+
+            if args.mask_method == "attention" and "weights" in ATTENTION_STORE:
                 all_maps = ATTENTION_STORE["weights"]
                 # Structure: Self, CrossImg, CrossText per block.
                 # Total blocks: 32. Total maps expected: 96.
@@ -321,12 +368,6 @@ def main():
                     corgi_map = combined_map[0] # [Lq]
                     
                     # Reshape Lq -> (F_lat, H_lat, W_lat)
-                    # NOTE: Lq flattening order in Wan?
-                    # x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-                    # x = [u.flatten(2).transpose(1, 2) for u in x]
-                    # flatten(2) flattens D, H, W (where D=F_patches).
-                    # So Lq = F_p * H_p * W_p.
-                    
                     f_lat_dim = latent.shape[1] # F_lat_encoded
                     h_lat_dim = latent.shape[2]
                     w_lat_dim = latent.shape[3]
@@ -334,26 +375,17 @@ def main():
                     grid_f = f_lat_dim
                     grid_h = h_lat_dim // patch_size[1]
                     grid_w = w_lat_dim // patch_size[2]
-                    # Actually grid sizes are computed in model.py:
-                    # grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-                    # where u is after patch_embedding.
-                    # patch_embedding stride = patch_size.
-                    # so grid_f = F / P_t
-                    # grid_h = H / P_h
-                    # grid_w = W / P_w
                     
-                    # Let's trust logic
                     try:
                         corgi_map_3d = corgi_map.view(grid_f, grid_h, grid_w)
                         
                         # Interpolate to Latent Size [1, 1, F, H, W]
-                        # 3D interpolate needs [N, C, D, H, W]
                         corgi_map_3d = corgi_map_3d.unsqueeze(0).unsqueeze(0)
                         
                         corgi_mask = torch.nn.functional.interpolate(
                             corgi_map_3d,
                             size=(f_lat_dim, h_lat_dim, w_lat_dim),
-                            mode='nearest' # Use nearest or linear?
+                            mode='nearest' 
                         )
                         corgi_mask = corgi_mask.squeeze(1) # [1, F, H, W]
                         
@@ -362,9 +394,7 @@ def main():
                         
                         # Save visualization as video
                         if i % args.log_frequency == 0:
-                            # vis_mask is [1, F, H, W]
                             mask_video_tensor = vis_mask.unsqueeze(1) # [1, 1, F, H, W]
-                            
                             cache_video(
                                 tensor=mask_video_tensor,
                                 save_file=os.path.join(mask_dir, f"step_{i:03d}_attn.mp4"),
@@ -375,36 +405,106 @@ def main():
                             )
                         
                         # Create Binary Mask
-                        # Thresholding
-                        binary_mask = (vis_mask > 0.15).float() # Lower threshold to catch more corgi?
+                        binary_mask = (vis_mask > 0.15).float() 
                         
-                        # Enhance mask (fill holes, dilate) if possible, but difficult in tensor.
-                        # Simple Dilation via MaxPool
+                        # Enhance mask
                         binary_mask = torch.nn.functional.max_pool3d(
                             binary_mask, kernel_size=3, stride=1, padding=1
                         )
                         
                         final_mask = binary_mask.unsqueeze(1).repeat(1, 16, 1, 1, 1).to(device)
                         
-                        # Save binary mask as video
-                        if i % args.log_frequency == 0:
-                            bin_video_tensor = binary_mask.unsqueeze(1) # [1, 1, F, H, W]
-                            cache_video(
-                                tensor=bin_video_tensor,
-                                save_file=os.path.join(mask_dir, f"step_{i:03d}_mask.mp4"),
-                                fps=16,
-                                nrow=1,
-                                normalize=False,
-                                value_range=(0, 1)
-                            )
-                            
                     except Exception as e:
                         print(f"Reshape Error: {e}")
                         final_mask = torch.zeros_like(latent).to(device)
-                else:
-                    final_mask = torch.zeros_like(latent).to(device)
-            else:
-                 final_mask = torch.zeros_like(latent).to(device)
+
+            elif args.mask_method == "sam2":
+                 with torch.no_grad():
+                     # Calculate pred_x0
+                     sigma_t = scheduler.sigmas[i].to(device)
+                     pred_x0 = latent - sigma_t * noise_pred
+                     
+                     # Decode with TinyVAE
+                     # pred_x0: [16, F, H, W]
+                     # TinyVAE decode expects list of [C, F, H, W]
+                     rec_video = tiny_vae.decode([pred_x0])[0] 
+                     
+                     # Process frames for SAM2
+                     # Temp dir
+                     frame_dir = os.path.join(save_dir, "temp_frames")
+                     if os.path.exists(frame_dir):
+                         shutil.rmtree(frame_dir)
+                     os.makedirs(frame_dir, exist_ok=True)
+                     
+                     # Convert to uint8 images
+                     rec_video_np = (rec_video * 0.5 + 0.5).clamp(0, 1)
+                     rec_video_np = (rec_video_np * 255).to(torch.uint8).cpu().permute(1, 2, 3, 0).numpy() # [F, H, W, 3]
+                     
+                     for f_idx in range(rec_video_np.shape[0]):
+                          f_path = os.path.join(frame_dir, f"{f_idx:05d}.jpg")
+                          # RGB to BGR for cv2
+                          cv2.imwrite(f_path, cv2.cvtColor(rec_video_np[f_idx], cv2.COLOR_RGB2BGR))
+                     
+                     # Run SAM2
+                     inference_state = sam2_predictor.init_state(video_path=frame_dir)
+                     sam2_predictor.reset_state(inference_state)
+                     
+                     # Add initial mask (Frame 0)
+                     _, _, _ = sam2_predictor.add_new_mask(
+                         inference_state=inference_state,
+                         frame_idx=0,
+                         obj_id=1,
+                         mask=initial_mask_binary
+                     )
+                     
+                     # Propagate
+                     video_segments = {}
+                     for out_frame_idx, out_obj_ids, out_mask_logits in sam2_predictor.propagate_in_video(inference_state):
+                          if 1 in out_obj_ids:
+                               idx = out_obj_ids.index(1)
+                               mask = (out_mask_logits[idx] > 0.0).float().cpu() # [1, H, W]
+                               video_segments[out_frame_idx] = mask
+                          else:
+                               video_segments[out_frame_idx] = torch.zeros(1, 512, 512)
+                     
+                     # Stack masks
+                     sorted_frames = sorted(video_segments.keys())
+                     mask_stack = torch.stack([video_segments[f] for f in sorted_frames], dim=0) # [F_frames, 1, H, W]
+                     
+                     # Resize to Latent
+                     # [F_frames, 1, H, W] -> [1, 1, F_frames, H, W] for interpolate
+                     mask_stack = mask_stack.permute(1, 0, 2, 3).unsqueeze(0)
+                     
+                     mask_lat = torch.nn.functional.interpolate(
+                          mask_stack,
+                          size=(latent.shape[1], latent.shape[2], latent.shape[3]),
+                          mode='nearest'
+                     )
+                     
+                     final_mask = mask_lat.to(device)
+                     # Expand channels [1, 16, F, H, W]
+                     final_mask = final_mask.repeat(1, 16, 1, 1, 1)
+                     
+                     # Define binary_mask for visualization downstream
+                     binary_mask = mask_lat.squeeze(0).to(device)
+
+            # Save binary mask as video
+            if i % args.log_frequency == 0 and 'binary_mask' in locals():
+                bin_video_tensor = binary_mask.unsqueeze(1) # [1, 1, F, H, W]
+                # Try catch for dimension mismatch
+                try:
+                    cache_video(
+                        tensor=bin_video_tensor,
+                        save_file=os.path.join(mask_dir, f"step_{i:03d}_mask.mp4"),
+                        fps=16,
+                        nrow=1,
+                        normalize=False,
+                        value_range=(0, 1)
+                    )
+                except Exception as e:
+                    print(f"Error saving mask video: {e}")
+
+            # Save binary mask as video done below...
 
             # --------------------------------------------------------------
             # x0 Visualization (Before & After Guidance)
