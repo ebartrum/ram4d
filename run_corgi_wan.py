@@ -282,14 +282,23 @@ def main():
                 block_end = 24
                 
                 selected_maps = []
-                for b_idx in range(block_start, block_end):
-                    map_idx = b_idx * 3 + 2 # Text Cross Attn
-                    if map_idx < len(all_maps):
-                        attn_map = all_maps[map_idx] # [B, Heads, Lq, Lk]
-                        selected_maps.append(attn_map)
+                image_maps_count = 0
+                text_maps_count = 0
                 
+                for b_idx in range(len(all_maps)):
+                    attn_map = all_maps[b_idx] # [B, Heads, Lq, Lk]
+                    # Check if this is the T5 Cross-Attention (Lk == 512)
+                    if attn_map.shape[-1] == 512:
+                         selected_maps.append(attn_map)
+                         text_maps_count += 1
+                    else:
+                         image_maps_count += 1
+                
+                if i % 10 == 0:
+                     print(f"Step {i}: Used {text_maps_count} text maps, filtered {image_maps_count} other maps (image/self).")
+
                 if selected_maps:
-                    # [N_layers, B, Heads, Lq, Lk] -> mean over layers -> [B, Heads, Lq, Lk]
+                    # [N_layers, B, Heads, Lq, Lk] -> mean over layers
                     stacked_maps = torch.stack(selected_maps).mean(dim=0)
                     
                     # Mean over heads -> [B, Lq, Lk]
