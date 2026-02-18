@@ -221,20 +221,23 @@ def main():
     arg_null = {'context': context_null, 'clip_fea': clip_context, 'seq_len': max_seq_len, 'y': [y]}
     
     # ------------------------------------------------------------------
-    # Initialize SAM2 and TinyVAE if needed
+    # Initialize SAM2 and TinyVAE
     # ------------------------------------------------------------------
     sam2_predictor = None
     tiny_vae = None
     sam2_inference_state = None
     initial_mask_binary = None
 
-    if args.mask_method == "sam2":
-        print("Initializing SAM2 and TinyVAE...")
-        # TinyVAE
-        tiny_vae_path = "checkpoints/taew2_1.pth"
-        if not os.path.exists(tiny_vae_path):
-             raise FileNotFoundError(f"TinyVAE checkpoint not found at {tiny_vae_path}")
+    # Always try to load TinyVAE for fast decoding
+    tiny_vae_path = "checkpoints/taew2_1.pth"
+    if os.path.exists(tiny_vae_path):
+        print(f"Loading TinyVAE from {tiny_vae_path}...")
         tiny_vae = WanCompatibleTAEHV(checkpoint_path=tiny_vae_path).to(device).eval()
+    else:
+        print(f"WARNING: TinyVAE checkpoint not found at {tiny_vae_path}. Debug decoding will be slow.")
+
+    if args.mask_method == "sam2":
+        print("Initializing SAM2...")
         
         # SAM2
         sam2_checkpoint = "checkpoints/sam2_hiera_tiny.pt"
@@ -525,11 +528,13 @@ def main():
                     mixed_x0 = msk * pred_x0 + (1 - msk) * bg_clean
                     
                     print(f"Decoding debug videos at step {i}...")
-                    # Decode both
-                    # VAE decode allows list
-                    wan_i2v.vae.model.to(device)
-                    decoded_list = wan_i2v.vae.decode([pred_x0.to(device), mixed_x0.to(device)])
-                    wan_i2v.vae.model.cpu()
+                    # Decode both using TinyVAE if available
+                    if tiny_vae is not None:
+                         decoded_list = tiny_vae.decode([pred_x0.to(device), mixed_x0.to(device)])
+                    else:
+                         wan_i2v.vae.model.to(device)
+                         decoded_list = wan_i2v.vae.decode([pred_x0.to(device), mixed_x0.to(device)])
+                         wan_i2v.vae.model.cpu()
                     
                     # Save pred_x0
                     cache_video(
@@ -578,7 +583,16 @@ def main():
             # Blend
             # Mask is 1 for Corgi, 0 for BG.
             # latent_next = Mask * latent_next + (1-Mask) * bg_noisy
+            # Blend
+            # Mask is 1 for Corgi, 0 for BG.
+            # latent_next = Mask * latent_next + (1-Mask) * bg_noisy
             latent = final_mask.squeeze(0) * latent_next + (1 - final_mask.squeeze(0)) * bg_noisy
+            
+            # Aggressive Cleanup
+            if args.mask_method == "sam2":
+                 import gc
+                 gc.collect()
+                 torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # 7. Decode and Save
