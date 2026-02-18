@@ -477,6 +477,7 @@ def main():
     # ------------------------------------------------------------------
     print("Decoding...")
     wan_i2v.model.cpu()
+    wan_i2v.vae.model.to(device)
     with torch.no_grad():
         x0 = [latent.to(device)]
         videos = wan_i2v.vae.decode(x0)
