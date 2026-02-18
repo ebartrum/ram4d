@@ -30,14 +30,22 @@ def main():
     parser.add_argument("--prompt_path", type=str, default="data/captions/corgi_video.txt", help="Path to text prompt")
     parser.add_argument("--frame_num", type=int, default=81, help="Number of frames")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--output_file", type=str, default="corgi_experiment.mp4", help="Output filename")
-    parser.add_argument("--output_mask_dir", type=str, default="output/debug_masks", help="Directory to save debug masks")
+    parser.add_argument("--output_name", type=str, default="corgi_experiment", help="Name of the experiment (subdirectory in output/)")
     parser.add_argument("--sampling_steps", type=int, default=50, help="Number of sampling steps")
     parser.add_argument("--guide_scale", type=float, default=5.0, help="Classifier free guidance scale")
     parser.add_argument("--log_frequency", type=int, default=10, help="Frequency of logging/saving debug artifacts (in steps)")
     args = parser.parse_args()
 
-    os.makedirs(args.output_mask_dir, exist_ok=True)
+    # Setup output directories
+    save_dir = os.path.join("output", args.output_name)
+    mask_dir = os.path.join(save_dir, "debug_masks")
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(mask_dir, exist_ok=True)
+    
+    # Save args for reference
+    with open(os.path.join(save_dir, "args.txt"), "w") as f:
+        for k, v in vars(args).items():
+            f.write(f"{k}: {v}\n")
 
     device_id = 0
     rank = 0
@@ -359,7 +367,7 @@ def main():
                             
                             cache_video(
                                 tensor=mask_video_tensor,
-                                save_file=os.path.join(args.output_mask_dir, f"step_{i:03d}_attn.mp4"),
+                                save_file=os.path.join(mask_dir, f"step_{i:03d}_attn.mp4"),
                                 fps=16,
                                 nrow=1,
                                 normalize=False, 
@@ -383,7 +391,7 @@ def main():
                             bin_video_tensor = binary_mask.unsqueeze(1) # [1, 1, F, H, W]
                             cache_video(
                                 tensor=bin_video_tensor,
-                                save_file=os.path.join(args.output_mask_dir, f"step_{i:03d}_mask.mp4"),
+                                save_file=os.path.join(mask_dir, f"step_{i:03d}_mask.mp4"),
                                 fps=16,
                                 nrow=1,
                                 normalize=False,
@@ -426,7 +434,7 @@ def main():
                     # Save pred_x0
                     cache_video(
                         tensor=decoded_list[0][None],
-                        save_file=os.path.join(args.output_mask_dir, f"step_{i:03d}_pred_x0.mp4"),
+                        save_file=os.path.join(mask_dir, f"step_{i:03d}_pred_x0.mp4"),
                         fps=16,
                         nrow=1,
                         normalize=True,
@@ -436,7 +444,7 @@ def main():
                     # Save mixed_x0
                     cache_video(
                         tensor=decoded_list[1][None],
-                        save_file=os.path.join(args.output_mask_dir, f"step_{i:03d}_mixed_x0.mp4"),
+                        save_file=os.path.join(mask_dir, f"step_{i:03d}_mixed_x0.mp4"),
                         fps=16,
                         nrow=1,
                         normalize=True,
@@ -485,7 +493,7 @@ def main():
             
     cache_video(
         tensor=videos[0][None],
-        save_file=os.path.join("output", args.output_file),
+        save_file=os.path.join(save_dir, "final_output.mp4"),
         fps=16,
         nrow=1,
         normalize=True,
