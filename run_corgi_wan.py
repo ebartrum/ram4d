@@ -32,6 +32,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output_file", type=str, default="corgi_experiment.mp4", help="Output filename")
     parser.add_argument("--output_mask_dir", type=str, default="output/debug_masks", help="Directory to save debug masks")
+    parser.add_argument("--sampling_steps", type=int, default=50, help="Number of sampling steps")
+    parser.add_argument("--guide_scale", type=float, default=5.0, help="Classifier free guidance scale")
+    parser.add_argument("--log_frequency", type=int, default=10, help="Frequency of logging/saving debug artifacts (in steps)")
     args = parser.parse_args()
 
     os.makedirs(args.output_mask_dir, exist_ok=True)
@@ -188,7 +191,7 @@ def main():
     # 6. Generation Loop
     # ------------------------------------------------------------------
     scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1, use_dynamic_shifting=False)
-    scheduler.set_timesteps(50, device=device, shift=5.0) 
+    scheduler.set_timesteps(args.sampling_steps, device=device, shift=5.0) 
     timesteps = scheduler.timesteps
     
     seed_g = torch.Generator(device=device)
@@ -263,7 +266,7 @@ def main():
 
             
             # CFG
-            noise_pred = noise_pred_uncond + 5.0 * (noise_pred_cond - noise_pred_uncond)
+            noise_pred = noise_pred_uncond + args.guide_scale * (noise_pred_cond - noise_pred_uncond)
             
             # Standard Scheduler Step
             temp_x0 = scheduler.step(noise_pred.unsqueeze(0), t, latent.unsqueeze(0), return_dict=False, generator=seed_g)[0]
@@ -294,7 +297,7 @@ def main():
                     else:
                          image_maps_count += 1
                 
-                if i % 10 == 0:
+                if i % args.log_frequency == 0:
                      print(f"Step {i}: Used {text_maps_count} text maps, filtered {image_maps_count} other maps (image/self).")
 
                 if selected_maps:
@@ -350,7 +353,7 @@ def main():
                         vis_mask = (corgi_mask - corgi_mask.min()) / (corgi_mask.max() - corgi_mask.min() + 1e-6)
                         
                         # Save visualization as video
-                        if i % 10 == 0:
+                        if i % args.log_frequency == 0:
                             # vis_mask is [1, F, H, W]
                             mask_video_tensor = vis_mask.unsqueeze(1) # [1, 1, F, H, W]
                             
@@ -376,7 +379,7 @@ def main():
                         final_mask = binary_mask.unsqueeze(1).repeat(1, 16, 1, 1, 1).to(device)
                         
                         # Save binary mask as video
-                        if i % 10 == 0:
+                        if i % args.log_frequency == 0:
                             bin_video_tensor = binary_mask.unsqueeze(1) # [1, 1, F, H, W]
                             cache_video(
                                 tensor=bin_video_tensor,
@@ -398,7 +401,7 @@ def main():
             # --------------------------------------------------------------
             # x0 Visualization (Before & After Guidance)
             # --------------------------------------------------------------
-            if i % 10 == 0:
+            if i % args.log_frequency == 0:
                 with torch.no_grad():
                     # Calculate pred_x0
                     # x0 = xt - sigma * v
