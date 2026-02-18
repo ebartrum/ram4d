@@ -349,12 +349,19 @@ def main():
                         # Normalize 0-1
                         vis_mask = (corgi_mask - corgi_mask.min()) / (corgi_mask.max() - corgi_mask.min() + 1e-6)
                         
-                        # Save visualization
+                        # Save visualization as video
                         if i % 10 == 0:
-                            f_idx = f_lat_dim // 2
-                            slice_np = vis_mask[0, f_idx].cpu().numpy()
-                            slice_img = Image.fromarray((slice_np * 255).astype(np.uint8))
-                            slice_img.save(os.path.join(args.output_mask_dir, f"step_{i:03d}_attn.png"))
+                            # vis_mask is [1, F, H, W]
+                            mask_video_tensor = vis_mask.unsqueeze(1) # [1, 1, F, H, W]
+                            
+                            cache_video(
+                                tensor=mask_video_tensor,
+                                save_file=os.path.join(args.output_mask_dir, f"step_{i:03d}_attn.mp4"),
+                                fps=16,
+                                nrow=1,
+                                normalize=False, 
+                                value_range=(0, 1)
+                            )
                         
                         # Create Binary Mask
                         # Thresholding
@@ -368,12 +375,17 @@ def main():
                         
                         final_mask = binary_mask.unsqueeze(1).repeat(1, 16, 1, 1, 1).to(device)
                         
-                        # Save binary mask
+                        # Save binary mask as video
                         if i % 10 == 0:
-                            f_idx = f_lat_dim // 2
-                            slice_np = binary_mask[0, f_idx].cpu().numpy()
-                            slice_img = Image.fromarray((slice_np * 255).astype(np.uint8))
-                            slice_img.save(os.path.join(args.output_mask_dir, f"step_{i:03d}_mask.png"))
+                            bin_video_tensor = binary_mask.unsqueeze(1) # [1, 1, F, H, W]
+                            cache_video(
+                                tensor=bin_video_tensor,
+                                save_file=os.path.join(args.output_mask_dir, f"step_{i:03d}_mask.mp4"),
+                                fps=16,
+                                nrow=1,
+                                normalize=False,
+                                value_range=(0, 1)
+                            )
                             
                     except Exception as e:
                         print(f"Reshape Error: {e}")
@@ -382,6 +394,51 @@ def main():
                     final_mask = torch.zeros_like(latent).to(device)
             else:
                  final_mask = torch.zeros_like(latent).to(device)
+
+            # --------------------------------------------------------------
+            # x0 Visualization (Before & After Guidance)
+            # --------------------------------------------------------------
+            if i % 10 == 0:
+                with torch.no_grad():
+                    # Calculate pred_x0
+                    # x0 = xt - sigma * v
+                    sigma_t = scheduler.sigmas[i].to(device)
+                    pred_x0 = latent - sigma_t * noise_pred
+                    
+                    # Calculate mixed_x0 (Target)
+                    # This represents the "After Guidance" manifold state we are aiming for
+                    # (Background forced to clean bg, Foreground is model prediction)
+                    # final_mask is [1, 16, F, H, W], bg_latents is [1, 16, F, H, W]
+                    msk = final_mask.squeeze(0)
+                    bg_clean = bg_latents.squeeze(0)
+                    mixed_x0 = msk * pred_x0 + (1 - msk) * bg_clean
+                    
+                    print(f"Decoding debug videos at step {i}...")
+                    # Decode both
+                    # VAE decode allows list
+                    wan_i2v.vae.model.to(device)
+                    decoded_list = wan_i2v.vae.decode([pred_x0.to(device), mixed_x0.to(device)])
+                    wan_i2v.vae.model.cpu()
+                    
+                    # Save pred_x0
+                    cache_video(
+                        tensor=decoded_list[0][None],
+                        save_file=os.path.join(args.output_mask_dir, f"step_{i:03d}_pred_x0.mp4"),
+                        fps=16,
+                        nrow=1,
+                        normalize=True,
+                        value_range=(-1, 1)
+                    )
+                    
+                    # Save mixed_x0
+                    cache_video(
+                        tensor=decoded_list[1][None],
+                        save_file=os.path.join(args.output_mask_dir, f"step_{i:03d}_mixed_x0.mp4"),
+                        fps=16,
+                        nrow=1,
+                        normalize=True,
+                        value_range=(-1, 1)
+                    )
 
             # --------------------------------------------------------------
             # Blend
@@ -397,27 +454,15 @@ def main():
             if i < len(timesteps) - 1:
                 next_t = timesteps[i+1]
                 # Add noise to clean background latents to match 'next_t' level
-                # scheduler.add_noise
-                # Need to check scheduler sigmas.
-                # If t=0 (last step), we want fully clean.
-                
-                # Careful: Scheduler might use different conventions.
-                # FlowUniPCMultistepScheduler
-                # timesteps are usually decreasing.
-                
                 bg_noisy = scheduler.add_noise(
                     bg_latents,
-                    noise, # Is this correct noise?
-                    # Ideally we use the *same* noise used for initialization to ensure consistency?
-                    # Or random noise?
-                    # If we use random noise, the background will "shake" every step.
-                    # We MUST use fixed noise.
-                    # Is 'noise' variable still holding the initial noise? Yes.
+                    noise, # Using initial noise for consistency
                     torch.stack([next_t])
                 ).squeeze(0)
             else:
                 # Final step, t=0
                 bg_noisy = bg_latents.squeeze(0)
+
                 
             # Blend
             # Mask is 1 for Corgi, 0 for BG.
