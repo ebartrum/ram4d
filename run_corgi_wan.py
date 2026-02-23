@@ -53,6 +53,8 @@ def main():
     parser.add_argument("--mask_method", type=str, default="attention", choices=["attention", "sam2"], help="Method for mask estimation: 'attention' or 'sam2'")
     parser.add_argument("--mask_dilation", type=int, default=0, help="Dilation kernel size for mask (odd number). 0 to disable.")
     parser.add_argument("--mask_path", type=str, default="data/images/corgi_mask.png", help="Path to initial mask image for SAM2 (sam2 mode only)")
+    parser.add_argument("--width", type=int, default=512, help="Video width (Wan default: 832)")
+    parser.add_argument("--height", type=int, default=512, help="Video height (Wan default: 480)")
     args = parser.parse_args()
 
     # Setup output directories
@@ -93,10 +95,10 @@ def main():
     
     # Load images
     print(f"Loading background: {args.bg_image}")
-    bg_img = Image.open(args.bg_image).convert("RGB").resize((512, 512))
-    
+    bg_img = Image.open(args.bg_image).convert("RGB").resize((args.width, args.height))
+
     print(f"Loading input: {args.input_image}")
-    input_img = Image.open(args.input_image).convert("RGB").resize((512, 512))
+    input_img = Image.open(args.input_image).convert("RGB").resize((args.width, args.height))
     
     with open(args.prompt_path, "r") as f:
         prompt = f.read().strip()
@@ -117,7 +119,10 @@ def main():
         # returns list of [C, F_lat, H_lat, W_lat]
         bg_latents = wan_i2v.vae.encode([bg_video.squeeze(0)])[0]
         bg_latents = bg_latents.unsqueeze(0) # [1, C, F, H, W]
-    
+    # Derive latent spatial dims from bg_latents directly (more reliable than formula for non-square)
+    lat_h = bg_latents.shape[-2]
+    lat_w = bg_latents.shape[-1]
+
     # ------------------------------------------------------------------
     # 3. Prepare I2V Condition (Input Image)
     # ------------------------------------------------------------------
@@ -189,13 +194,9 @@ def main():
     wan_i2v.clip.model.cpu()
     
     # Prepare Y (Visual Condition)
-    aspect_ratio = 1.0
-    max_area = 512 * 512
     vae_stride = wan_i2v.vae_stride
     patch_size = wan_i2v.patch_size
-    
-    lat_h = round(np.sqrt(max_area * aspect_ratio) // vae_stride[1] // patch_size[1] * patch_size[1])
-    lat_w = round(np.sqrt(max_area / aspect_ratio) // vae_stride[2] // patch_size[2] * patch_size[2])
+    # lat_h, lat_w already derived from bg_latents above
     
     y = wan_i2v.vae.encode([
         torch.cat([
