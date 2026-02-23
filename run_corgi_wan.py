@@ -201,7 +201,11 @@ def main():
     msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
     msk = msk.transpose(1, 2)[0]
     y = torch.concat([msk, y])
-    
+
+    # Offload VAE to CPU to free memory before loading the 14B model
+    wan_i2v.vae.model.cpu()
+    torch.cuda.empty_cache()
+
     # ------------------------------------------------------------------
     # 6. Generation Loop
     # ------------------------------------------------------------------
