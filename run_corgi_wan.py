@@ -417,6 +417,12 @@ def main():
                         # Save visualization as video
                         if i % args.log_frequency == 0:
                             mask_video_tensor = vis_mask.unsqueeze(1) # [1, 1, F, H, W]
+                            mask_video_tensor = torch.nn.functional.interpolate(
+                                mask_video_tensor,
+                                size=(frame_num, args.height, args.width),
+                                mode='trilinear',
+                                align_corners=False,
+                            )
                             cache_video(
                                 tensor=mask_video_tensor,
                                 save_file=os.path.join(mask_dir, f"step_{i:03d}_attn.mp4"),
@@ -449,11 +455,11 @@ def main():
                      # Decode with TinyVAE
                      # pred_x0: [16, F, H, W]
                      # TinyVAE decode expects list of [C, F, H, W]
-                     rec_video = tiny_vae.decode([pred_x0])[0] 
+                     rec_video = tiny_vae.decode([pred_x0])[0]
                      
                      # Process frames for SAM2
                      # Temp dir
-                     frame_dir = os.path.join(save_dir, "temp_frames")
+                     frame_dir = "/tmp/ram4d_temp_frames"
                      if os.path.exists(frame_dir):
                          shutil.rmtree(frame_dir)
                      os.makedirs(frame_dir, exist_ok=True)
@@ -540,6 +546,11 @@ def main():
             # Save binary mask as video
             if i % args.log_frequency == 0 and 'binary_mask' in locals():
                 bin_video_tensor = binary_mask.unsqueeze(1) # [1, 1, F, H, W]
+                bin_video_tensor = torch.nn.functional.interpolate(
+                    bin_video_tensor,
+                    size=(frame_num, args.height, args.width),
+                    mode='nearest',
+                )
                 # Try catch for dimension mismatch
                 try:
                     cache_video(
@@ -574,33 +585,40 @@ def main():
                     mixed_x0 = msk * pred_x0 + (1 - msk) * bg_clean
                     
                     print(f"Decoding debug videos at step {i}...")
-                    # Decode both using TinyVAE if available
-                    if tiny_vae is not None:
-                         decoded_list = tiny_vae.decode([pred_x0.to(device), mixed_x0.to(device)])
-                    else:
-                         wan_i2v.vae.model.to(device)
-                         decoded_list = wan_i2v.vae.decode([pred_x0.to(device), mixed_x0.to(device)])
-                         wan_i2v.vae.model.cpu()
-                    
-                    # Save pred_x0
+                    vae = tiny_vae if tiny_vae is not None else wan_i2v.vae
+                    if tiny_vae is None:
+                        wan_i2v.vae.model.to(device)
+
+                    with torch.no_grad():
+                        decoded_pred = vae.decode([pred_x0.to(device)])[0]
+                    torch.cuda.empty_cache()
+
                     cache_video(
-                        tensor=decoded_list[0][None],
+                        tensor=decoded_pred[None],
                         save_file=os.path.join(mask_dir, f"step_{i:03d}_pred_x0.mp4"),
                         fps=16,
                         nrow=1,
                         normalize=True,
                         value_range=(-1, 1)
                     )
-                    
-                    # Save mixed_x0
+                    del decoded_pred
+
+                    with torch.no_grad():
+                        decoded_mixed = vae.decode([mixed_x0.to(device)])[0]
+                    torch.cuda.empty_cache()
+
+                    if tiny_vae is None:
+                        wan_i2v.vae.model.cpu()
+
                     cache_video(
-                        tensor=decoded_list[1][None],
+                        tensor=decoded_mixed[None],
                         save_file=os.path.join(mask_dir, f"step_{i:03d}_mixed_x0.mp4"),
                         fps=16,
                         nrow=1,
                         normalize=True,
                         value_range=(-1, 1)
                     )
+                    del decoded_mixed
 
             # --------------------------------------------------------------
             # Blend
