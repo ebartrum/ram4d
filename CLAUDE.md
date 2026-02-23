@@ -10,6 +10,41 @@ The 3D scene representation is **Gaussian Splatting (3DGS)**. The 3DGS rendering
 
 The scripts here are **experimental and exploratory**, tackling sub-problems (image inpainting, segmentation, mask propagation, video generation) that are building blocks toward the full 4D system. Not all scripts are current or part of an active pipeline — some may be outdated, duplicative, or dead ends from earlier experiments.
 
+## Development Workflow
+
+Code is **edited locally** (on this machine) and **executed remotely** on a GPU server.
+
+- **Local repo:** `/home/ed/Documents/repos/ram4d`
+- **Remote repo:** `~/repos/ram4d` on `lambda_instance` (SSH alias defined in `~/.ssh/config`)
+
+### Syncing code to the server
+
+Use `rsync` to push local changes to the server before running anything:
+```bash
+rsync -av --exclude='.git' --exclude='data' --exclude='output' \
+  /home/ed/Documents/repos/ram4d/ lambda_instance:~/repos/ram4d/
+```
+(Data and output directories are large and live only on the server — do not sync them back.)
+
+### Running commands
+
+The server uses a `docker-run` helper script that launches the correct Docker container with a conda environment activated. The conda environment is always `mvadapter`; the image tag depends on the server architecture:
+
+```bash
+# Default (arm64) instance:
+docker-run --env mvadapter --tag mvadapter <command>
+
+# amd64 instance:
+docker-run --env mvadapter --tag mvadapter-amd64 <command>
+```
+
+For GPU-dependent commands, either:
+- **Ask the user** to run the command on the server, or
+- **Run via SSH directly**, combining SSH + docker-run:
+```bash
+ssh lambda_instance "cd ~/repos/ram4d && docker-run --env mvadapter --tag mvadapter python run_corgi_wan.py --mask_method sam2"
+```
+
 ## Running Scripts
 
 All scripts are standalone and run directly with Python from the repo root:
