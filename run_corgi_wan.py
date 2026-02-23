@@ -50,8 +50,8 @@ def main():
     parser.add_argument("--sampling_steps", type=int, default=50, help="Number of sampling steps")
     parser.add_argument("--guide_scale", type=float, default=5.0, help="Classifier free guidance scale")
     parser.add_argument("--log_frequency", type=int, default=10, help="Frequency of logging/saving debug artifacts (in steps)")
-    parser.add_argument("--mask_method", type=str, default="attention", choices=["attention", "sam2"], help="Method for mask estimation: 'attention' or 'sam2'")
-    parser.add_argument("--mask_dilation", type=int, default=0, help="Dilation kernel size for mask (odd number). 0 to disable.")
+    parser.add_argument("--mask_method", type=str, default="sam2", choices=["attention", "sam2"], help="Method for mask estimation: 'attention' or 'sam2'")
+    parser.add_argument("--mask_dilation", type=int, default=15, help="Dilation kernel size for mask (odd number). 0 to disable.")
     parser.add_argument("--mask_path", type=str, default="data/images/corgi_mask.png", help="Path to initial mask image for SAM2 (sam2 mode only)")
     parser.add_argument("--width", type=int, default=832, help="Video width")
     parser.add_argument("--height", type=int, default=480, help="Video height")
@@ -130,54 +130,50 @@ def main():
     input_tensor = TF.to_tensor(input_img).sub_(0.5).div_(0.5).to(device) # [3, H, W]
     
     # ------------------------------------------------------------------
-    # 4. Find 'corgi' token index
+    # 4. Find subject token indices (attention mode only)
     # ------------------------------------------------------------------
-    
-    print("Analyzing prompt tokens...")
-    # T5 tokenizer wrapper
-    tokenizer_wrapper = wan_i2v.text_encoder.tokenizer
-    # The wrapper's __call__ returns input_ids tensor directly
-    input_ids = tokenizer_wrapper(prompt, return_tensors="pt")
-    input_ids = input_ids[0] # [L]
-    
-    # Access underlying HF tokenizer for decoding
-    tokenizer = tokenizer_wrapper.tokenizer
-    
-    print(f"Token IDs: {input_ids}")
-    
-    # Decode each token to find "corgi"
     corgi_indices = []
-    print("Token Debugging:")
-    for idx, t_id in enumerate(input_ids):
-        decoded = tokenizer.decode([t_id])
-        # Only print non-pad tokens for brevity
-        if hasattr(tokenizer, 'pad_token_id') and t_id == tokenizer.pad_token_id:
-            continue
-        if decoded.strip() == "<pad>":
-             continue
-             
-        print(f"Idx {idx}: {t_id} -> '{decoded}'")
-        # Check for 'corgi' in various forms (case insensitive, stripped)
-        # T5 often uses ' ' (SPIECE_UNDERLINE) for spaces.
-        clean_decoded = decoded.replace(' ', '').strip().lower()
-        if "corgi" in clean_decoded:
-             corgi_indices.append(idx)
-        elif "cor" in clean_decoded or "gi" in clean_decoded:
-             # Heuristic for split tokens often seen for 'corgi' -> ' cor' + 'gi'
-             # We might want to be more specific but collecting parts is okay for attention map.
-             if clean_decoded in ["cor", "gi", "corg"]:
-                 corgi_indices.append(idx)
+    if args.mask_method == "attention":
+        print("Analyzing prompt tokens...")
+        # T5 tokenizer wrapper
+        tokenizer_wrapper = wan_i2v.text_encoder.tokenizer
+        # The wrapper's __call__ returns input_ids tensor directly
+        input_ids = tokenizer_wrapper(prompt, return_tensors="pt")
+        input_ids = input_ids[0] # [L]
 
-    if not corgi_indices:
-        print("WARNING: 'corgi' not found in individual tokens. Trying to find sequence...")
-        # Fallback: check full decoding
-        full_decoded = tokenizer.decode(input_ids)
-        print(f"Full decoded: '{full_decoded}'")
-        # If we can't find it token-wise, defaulting to a heuristic range might be safer if we knew where it was.
-        # But let's stick to the warning.
-        raise ValueError("Could not locate 'corgi' or related tokens in the prompt tokens. Aborting.")
-    
-    print(f"Targeting token indices: {corgi_indices}")
+        # Access underlying HF tokenizer for decoding
+        tokenizer = tokenizer_wrapper.tokenizer
+
+        print(f"Token IDs: {input_ids}")
+
+        # Decode each token to find "corgi"
+        print("Token Debugging:")
+        for idx, t_id in enumerate(input_ids):
+            decoded = tokenizer.decode([t_id])
+            # Only print non-pad tokens for brevity
+            if hasattr(tokenizer, 'pad_token_id') and t_id == tokenizer.pad_token_id:
+                continue
+            if decoded.strip() == "<pad>":
+                continue
+
+            print(f"Idx {idx}: {t_id} -> '{decoded}'")
+            # Check for 'corgi' in various forms (case insensitive, stripped)
+            # T5 often uses ' ' (SPIECE_UNDERLINE) for spaces.
+            clean_decoded = decoded.replace(' ', '').strip().lower()
+            if "corgi" in clean_decoded:
+                corgi_indices.append(idx)
+            elif "cor" in clean_decoded or "gi" in clean_decoded:
+                # Heuristic for split tokens often seen for 'corgi' -> ' cor' + 'gi'
+                if clean_decoded in ["cor", "gi", "corg"]:
+                    corgi_indices.append(idx)
+
+        if not corgi_indices:
+            print("WARNING: 'corgi' not found in individual tokens. Trying to find sequence...")
+            full_decoded = tokenizer.decode(input_ids)
+            print(f"Full decoded: '{full_decoded}'")
+            raise ValueError("Could not locate 'corgi' or related tokens in the prompt tokens. Aborting.")
+
+        print(f"Targeting token indices: {corgi_indices}")
 
     # ------------------------------------------------------------------
     # 5. Encoding Context
@@ -287,7 +283,10 @@ def main():
     
     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=wan_i2v.param_dtype):
         for i, t in enumerate(tqdm(timesteps)):
-            
+
+            # Guidance annealing: 1.0 at step 0 (full noise), 0.0 at final step
+            annealing_weight = 1.0 - i / (len(timesteps) - 1)
+
             # Clear attention store
             if "weights" in ATTENTION_STORE:
                 del ATTENTION_STORE["weights"]
@@ -527,7 +526,27 @@ def main():
                      
                      # Use adaptive_max_pool3d to handle the exact dimensions safely
                      mask_stack_dilated = mask_stack_dilated.permute(1, 0, 2, 3).unsqueeze(0) # [1, 1, F, H, W]
-                     
+
+                     # Temporal dilation: fills in blank frames where SAM2 lost tracking.
+                     # max_pool along time means any valid frame within the window propagates
+                     # the mask to neighbouring blank frames (consistent with spatial dilation above).
+                     temporal_kernel = 9
+                     mask_stack_dilated = torch.nn.functional.max_pool3d(
+                         mask_stack_dilated,
+                         kernel_size=(temporal_kernel, 1, 1),
+                         stride=1,
+                         padding=(temporal_kernel // 2, 0, 0),
+                     )
+
+                     # Forward-fill: replace any remaining blank frames with the last seen non-blank mask
+                     last_seen_mask = None
+                     for f in range(mask_stack_dilated.shape[2]):
+                         frame = mask_stack_dilated[0, 0, f]  # [H, W]
+                         if frame.sum() > 0:
+                             last_seen_mask = frame.clone()
+                         elif last_seen_mask is not None:
+                             mask_stack_dilated[0, 0, f] = last_seen_mask
+
                      mask_lat = torch.nn.functional.adaptive_max_pool3d(
                           mask_stack_dilated,
                           output_size=(latent.shape[1], latent.shape[2], latent.shape[3])
@@ -580,9 +599,9 @@ def main():
                     # This represents the "After Guidance" manifold state we are aiming for
                     # (Background forced to clean bg, Foreground is model prediction)
                     # final_mask is [1, 16, F, H, W], bg_latents is [1, 16, F, H, W]
-                    msk = final_mask.squeeze(0)
+                    annealed_bg_debug = (1 - final_mask.squeeze(0)) * annealing_weight
                     bg_clean = bg_latents.squeeze(0)
-                    mixed_x0 = msk * pred_x0 + (1 - msk) * bg_clean
+                    mixed_x0 = pred_x0 + annealed_bg_debug * (bg_clean - pred_x0)
                     
                     print(f"Decoding debug videos at step {i}...")
                     vae = tiny_vae if tiny_vae is not None else wan_i2v.vae
@@ -650,7 +669,10 @@ def main():
             # Blend
             # Mask is 1 for Corgi, 0 for BG.
             # latent_next = Mask * latent_next + (1-Mask) * bg_noisy
-            latent = final_mask.squeeze(0) * latent_next + (1 - final_mask.squeeze(0)) * bg_noisy
+            # Anneal background forcing only: foreground stays hard at model output,
+            # background guidance fades from bg_noisy -> model output over steps.
+            annealed_bg = (1 - final_mask.squeeze(0)) * annealing_weight
+            latent = latent_next + annealed_bg * (bg_noisy - latent_next)
             
             # Aggressive Cleanup
             if args.mask_method == "sam2":
