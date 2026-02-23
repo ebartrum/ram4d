@@ -1,5 +1,18 @@
-
+import sys
 import os
+import glob
+
+# Fix sklearn TLS issue: LD_PRELOAD must be set before the dynamic linker loads
+# scikit-learn's bundled libgomp. We do this by re-execing the process.
+if "LIBGOMP_PRELOADED" not in os.environ:
+    libgomp_files = glob.glob(
+        "/home/ubuntu/miniconda3/envs/mvadapter/lib/python*/site-packages/scikit_learn.libs/libgomp*.so*"
+    )
+    if libgomp_files:
+        os.environ["LD_PRELOAD"] = libgomp_files[0]
+        os.environ["LIBGOMP_PRELOADED"] = "1"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
 import cv2
 import torch
 import numpy as np
