@@ -40,9 +40,29 @@ docker-run --env mvadapter --tag mvadapter-amd64 <command>
 
 For GPU-dependent commands, either:
 - **Ask the user** to run the command on the server, or
-- **Run via SSH directly**, combining SSH + docker-run:
+- **Run via SSH directly**, combining SSH + docker-run. Always include `--non-interactive` when running via SSH — without it, docker-run tries to allocate a TTY and fails with "the input device is not a TTY":
 ```bash
-ssh lambda_instance "cd ~/repos/ram4d && docker-run --env mvadapter --tag mvadapter python run_corgi_wan.py --mask_method sam2"
+ssh lambda_instance "cd ~/repos/ram4d && docker-run --non-interactive --env mvadapter --tag mvadapter python run_corgi_wan.py --mask_method sam2"
+```
+
+### Syncing data and outputs
+
+Input data (`data/images/`, `data/captions/`) must be rsynced to the server separately if not already present — they are excluded from the main code sync. Sync them with:
+```bash
+rsync -av /home/ed/Documents/repos/ram4d/data/images/ lambda_instance:~/repos/ram4d/data/images/
+rsync -av /home/ed/Documents/repos/ram4d/data/captions/ lambda_instance:~/repos/ram4d/data/captions/
+```
+
+To retrieve results, sync back the relevant dated output subdirectory:
+```bash
+rsync -av lambda_instance:~/repos/ram4d/output/YYYY.MM.DD/ /home/ed/Documents/repos/ram4d/output/YYYY.MM.DD/
+```
+
+### Output organisation
+
+All outputs are saved under `output/YYYY.MM.DD/` (e.g. `output/2026.02.23/`). Always pass `--output_path output/YYYY.MM.DD/<filename>` when running scripts, and ensure the directory exists on the server beforehand:
+```bash
+ssh lambda_instance "mkdir -p ~/repos/ram4d/output/YYYY.MM.DD"
 ```
 
 ## Running Scripts
