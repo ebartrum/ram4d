@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--log_frequency", type=int, default=10, help="Frequency of logging/saving debug artifacts (in steps)")
     parser.add_argument("--mask_method", type=str, default="attention", choices=["attention", "sam2"], help="Method for mask estimation: 'attention' or 'sam2'")
     parser.add_argument("--mask_dilation", type=int, default=0, help="Dilation kernel size for mask (odd number). 0 to disable.")
+    parser.add_argument("--mask_path", type=str, default="data/images/corgi_mask.png", help="Path to initial mask image for SAM2 (sam2 mode only)")
     args = parser.parse_args()
 
     # Setup output directories
@@ -248,7 +249,7 @@ def main():
         sam2_predictor = build_sam2_video_predictor(sam2_config, sam2_checkpoint)
         
         # Load Initial Mask
-        mask_path = "data/images/corgi_mask.png"
+        mask_path = args.mask_path
         if not os.path.exists(mask_path):
              raise FileNotFoundError(f"Initial mask not found at {mask_path}")
         
