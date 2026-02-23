@@ -53,8 +53,8 @@ def main():
     parser.add_argument("--mask_method", type=str, default="attention", choices=["attention", "sam2"], help="Method for mask estimation: 'attention' or 'sam2'")
     parser.add_argument("--mask_dilation", type=int, default=0, help="Dilation kernel size for mask (odd number). 0 to disable.")
     parser.add_argument("--mask_path", type=str, default="data/images/corgi_mask.png", help="Path to initial mask image for SAM2 (sam2 mode only)")
-    parser.add_argument("--width", type=int, default=512, help="Video width (Wan default: 832)")
-    parser.add_argument("--height", type=int, default=512, help="Video height (Wan default: 480)")
+    parser.add_argument("--width", type=int, default=832, help="Video width")
+    parser.add_argument("--height", type=int, default=480, help="Video height")
     args = parser.parse_args()
 
     # Setup output directories
