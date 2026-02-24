@@ -64,8 +64,8 @@ def parse_args():
                         help="ActionMesh output directory (from run_actionmesh.py).")
     parser.add_argument("--source_dir", default=None,
                         help="Localised frames directory. Defaults to <output_path>/localised_frames.")
-    parser.add_argument("--text", default="high quality",
-                        help="Text prompt for MV-Adapter texture generation.")
+    parser.add_argument("--prompt_path", default=None,
+                        help="Path to a .txt file containing the text prompt for MV-Adapter texture generation.")
     parser.add_argument("--seed", type=int, default=-1,
                         help="Random seed (-1 = random).")
     parser.add_argument("--fps", type=int, default=16,
@@ -103,6 +103,14 @@ def main():
     if not os.path.exists(deformations_path):
         raise FileNotFoundError(f"deformations_vertices.npy not found at {deformations_path}")
 
+    # Load text prompt
+    if args.prompt_path:
+        with open(args.prompt_path) as f:
+            text_prompt = f.read().strip()
+    else:
+        text_prompt = "high quality"
+    print(f"Text prompt: {text_prompt}")
+
     device = "cuda"
 
     # Step 1: Generate texture via MV-Adapter
@@ -112,7 +120,7 @@ def main():
     textured_mesh_path = generator.generate_texture(
         mesh_path=mesh_path,
         image_path=image_path,
-        text_prompt=args.text,
+        text_prompt=text_prompt,
         save_dir=texture_dir,
         seed=args.seed,
     )
