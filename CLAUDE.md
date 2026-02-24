@@ -42,7 +42,7 @@ For GPU-dependent commands, either:
 - **Ask the user** to run the command on the server, or
 - **Run via SSH directly**, combining SSH + docker-run. Always include `--non-interactive` when running via SSH — without it, docker-run tries to allocate a TTY and fails with "the input device is not a TTY":
 ```bash
-ssh lambda_instance "cd ~/repos/ram4d && docker-run --non-interactive --env mvadapter --tag mvadapter python run_corgi_wan.py --mask_method sam2"
+ssh lambda_instance "cd ~/repos/ram4d && docker-run --non-interactive --env mvadapter --tag mvadapter python run_wan_fg_anim.py --mask_method sam2"
 ```
 
 ### Syncing data and outputs
@@ -88,8 +88,8 @@ python run_wan_inpainting.py --strength 1.0 --output output/result.mp4
 # I2V inpainting with Wan 14B (custom sampling loop, uses official_wan_repo/)
 python run_wan_i2v_inpaint.py --image data/images/foo.png --mask data/images/foo_mask.png --prompt_path data/captions/foo.txt
 
-# Attention-guided mask blending experiment (uses official_wan_repo/)
-python run_corgi_wan.py --mask_method attention  # or --mask_method sam2
+# Animate foreground on static background, conditioned on inpainted image (uses official_wan_repo/)
+python run_wan_fg_anim.py --mask_method attention  # or --mask_method sam2
 
 # First-Last Frame to Video with Wan 14B FLF2V
 python run_wan_flf.py
@@ -97,7 +97,7 @@ python run_wan_flf.py
 
 There are no tests, linters, or build systems configured.
 
-**Script status**: These are research experiments — some may be outdated, duplicative, or dead ends. The two most actively developed scripts are `run_corgi_wan.py` (attention + SAM2 mask blending) and `run_wan_i2v_inpaint.py` (I2V inpainting with custom denoising loop).
+**Script status**: These are research experiments — some may be outdated, duplicative, or dead ends. The two most actively developed scripts are `run_wan_fg_anim.py` (animate foreground on static background, attention + SAM2 mask blending) and `run_wan_i2v_inpaint.py` (I2V inpainting with custom denoising loop).
 
 ## Architecture
 
@@ -105,7 +105,7 @@ There are no tests, linters, or build systems configured.
 The project uses **two separate Wan repositories** that serve different purposes:
 
 - **`Wan2.1/`** – A custom fork containing `wan/text2video_inpaint.py` which defines `WanT2VInpaint`. This class extends `WanT2V` with video inpainting capability (latent blending). Used only by `run_wan_inpainting.py`.
-- **`official_wan_repo/`** – The official Wan repo providing `wan.WanI2V` and `wan.WanFLF2V`. Used by `run_wan_i2v_inpaint.py`, `run_corgi_wan.py`, and `run_wan_flf.py`. These scripts implement their own custom denoising loops (not using the built-in `.generate()`) to allow mask blending at each step.
+- **`official_wan_repo/`** – The official Wan repo providing `wan.WanI2V` and `wan.WanFLF2V`. Used by `run_wan_i2v_inpaint.py`, `run_wan_fg_anim.py`, and `run_wan_flf.py`. These scripts implement their own custom denoising loops (not using the built-in `.generate()`) to allow mask blending at each step.
 
 Both repos are added to `sys.path` at the top of each script that needs them. Do not import from both simultaneously in one script.
 
@@ -114,7 +114,7 @@ Both repos are added to `sys.path` at the top of each script that needs them. Do
 2. **Segmentation** (`run_segmentation.py`): Use LangSAM (language-guided SAM) to produce a binary mask for the foreground subject in the image.
 3. **Mask propagation** (`propogate_mask.py`): Use SAM2 video predictor to propagate the per-frame mask across a video.
 4. **Video input prep** (`prepare_wan_input.py`): Assembles static video (81 frames) and corresponding mask video from the image/mask.
-5. **Video generation/inpainting** (`run_wan_inpainting.py` / `run_wan_i2v_inpaint.py` / `run_corgi_wan.py`): Generates animated video while keeping certain regions fixed using latent blending.
+5. **Video generation/inpainting** (`run_wan_inpainting.py` / `run_wan_i2v_inpaint.py` / `run_wan_fg_anim.py`): Generates animated video while keeping certain regions fixed using latent blending.
 
 ### Key Supporting Files
 - **`taehv.py`**: Tiny AutoEncoder for Wan (TAEHV) — a fast approximate VAE for debug decoding. `WanCompatibleTAEHV` wraps `TAEHV` to match the `WanVideoVAE` interface (`.encode(List[Tensor])` / `.decode(List[Tensor])`). Requires checkpoint `checkpoints/taew2_1.pth`.

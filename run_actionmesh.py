@@ -25,7 +25,7 @@ from sam2.build_sam import build_sam2_video_predictor
 def parse_args():
     parser = argparse.ArgumentParser(description="4D reconstruction from Wan output (Phase 1: localization).")
     parser.add_argument("--source_video_dir", required=True,
-                        help="Path to run_corgi_wan.py output directory (must contain final_output.mp4 and args.txt).")
+                        help="Path to run_wan_fg_anim.py output directory (must contain final_output.mp4 and args.txt).")
     parser.add_argument("--output_path", required=True,
                         help="Directory to write all outputs.")
     parser.add_argument("--mask_path", default=None,
