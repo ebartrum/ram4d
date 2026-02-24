@@ -13,6 +13,10 @@ if "LIBGOMP_PRELOADED" not in os.environ:
         os.environ["LIBGOMP_PRELOADED"] = "1"
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
+# Add ActionMesh and its TripoSG dependency to path
+sys.path.insert(0, os.path.abspath("actionmesh"))
+sys.path.insert(0, os.path.abspath("actionmesh/third_party/TripoSG"))
+
 import argparse
 import json
 import cv2
@@ -23,7 +27,7 @@ from sam2.build_sam import build_sam2_video_predictor
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="4D reconstruction from Wan output (Phase 1: localization).")
+    parser = argparse.ArgumentParser(description="4D reconstruction from Wan output: localize then run ActionMesh.")
     parser.add_argument("--source_video_dir", required=True,
                         help="Path to run_wan_fg_anim.py output directory (must contain final_output.mp4 and args.txt).")
     parser.add_argument("--output_path", required=True,
@@ -34,6 +38,14 @@ def parse_args():
                         help="Localized frame size (square). Default: 512.")
     parser.add_argument("--margin", type=int, default=30,
                         help="Bounding box pixel margin. Default: 30.")
+    parser.add_argument("--seed", type=int, default=44,
+                        help="Random seed for ActionMesh. Default: 44.")
+    parser.add_argument("--stage_0_steps", type=int, default=None,
+                        help="TripoSG inference steps (default: 100 from config).")
+    parser.add_argument("--stage_1_steps", type=int, default=None,
+                        help="Temporal denoiser flow-matching steps (default: 30 from config).")
+    parser.add_argument("--fast", action="store_true",
+                        help="Fast mode: stage_0_steps=50, stage_1_steps=15.")
     return parser.parse_args()
 
 
@@ -51,7 +63,7 @@ def read_args_txt(args_txt_path):
 
 
 def extract_frames(video_path, output_dir):
-    """Extract all frames from a video as PNGs."""
+    """Extract all frames from a video as JPEGs (required by SAM2)."""
     os.makedirs(output_dir, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
     frame_count = 0
@@ -187,8 +199,59 @@ def localise_frames(frames_dir, masks_dir, output_dir, output_size, margin):
     print(f"Bounding boxes saved to {bbox_path}")
 
 
+def run_actionmesh(localised_dir, output_dir, seed, stage_0_steps, stage_1_steps):
+    """Run ActionMesh pipeline on localised frames to produce an animated 3D mesh."""
+    from actionmesh.pipeline import ActionMeshPipeline
+    from actionmesh.io.video_input import load_frames
+    from actionmesh.io.mesh_io import save_meshes, save_deformation
+
+    meshes_dir = os.path.join(output_dir, "meshes")
+    os.makedirs(meshes_dir, exist_ok=True)
+
+    # Load all localised frames (black-background PNGs); RMBG inside the pipeline
+    # will estimate alpha from the clean black background.
+    print(f"Loading localised frames from {localised_dir}...")
+    am_input = load_frames(localised_dir)
+    print(f"Loaded {am_input.n_frames} frames")
+
+    from hydra.core.global_hydra import GlobalHydra
+    GlobalHydra.instance().clear()
+
+    config_dir = os.path.abspath("actionmesh/actionmesh/configs")
+    print("Initializing ActionMeshPipeline...")
+    pipeline = ActionMeshPipeline(
+        config_name="actionmesh.yaml",
+        config_dir=config_dir,
+    )
+    pipeline.to("cuda")
+
+    kwargs = dict(seed=seed)
+    if stage_0_steps is not None:
+        kwargs["stage_0_steps"] = stage_0_steps
+    if stage_1_steps is not None:
+        kwargs["stage_1_steps"] = stage_1_steps
+
+    print(f"Running ActionMesh on {am_input.n_frames} frames (kwargs: {kwargs})...")
+    meshes = pipeline(input=am_input, **kwargs)
+    print(f"Generated {len(meshes)} meshes")
+
+    print(f"Saving per-frame GLB meshes to {meshes_dir}...")
+    save_meshes(meshes, output_dir=meshes_dir)
+
+    deform_path = os.path.join(output_dir, "deformations")
+    verts_path, faces_path = save_deformation(meshes, path=deform_path)
+    print(f"Saved deformation arrays: {verts_path}, {faces_path}")
+
+
 def main():
     args = parse_args()
+
+    # Apply --fast shorthand
+    stage_0_steps = args.stage_0_steps
+    stage_1_steps = args.stage_1_steps
+    if args.fast:
+        stage_0_steps = stage_0_steps or 50
+        stage_1_steps = stage_1_steps or 15
 
     corgi_dir = args.source_video_dir
     video_path = os.path.join(corgi_dir, "final_output.mp4")
@@ -228,18 +291,30 @@ def main():
 
     # Step 3: SAM2 mask propagation
     print("\n--- Step 3: SAM2 mask propagation ---")
-    checkpoint = "checkpoints/sam2_hiera_tiny.pt"
-    config = "sam2_hiera_t.yaml"
-    propagate_sam2_masks(frames_dir, mask_path, masks_dir, checkpoint, config)
+    if os.path.isdir(masks_dir) and os.listdir(masks_dir):
+        print(f"SAM2 masks already present in {masks_dir}, skipping propagation.")
+    else:
+        checkpoint = "checkpoints/sam2_hiera_tiny.pt"
+        config = "sam2_hiera_t.yaml"
+        propagate_sam2_masks(frames_dir, mask_path, masks_dir, checkpoint, config)
 
     # Step 4: Localize frames
     print("\n--- Step 4: Localizing frames ---")
-    localise_frames(frames_dir, masks_dir, localised_dir, args.output_size, args.margin)
+    if os.path.isdir(localised_dir) and os.listdir(localised_dir):
+        print(f"Localised frames already present in {localised_dir}, skipping localization.")
+    else:
+        localise_frames(frames_dir, masks_dir, localised_dir, args.output_size, args.margin)
+
+    # Step 5: ActionMesh inference
+    print("\n--- Step 5: ActionMesh inference ---")
+    run_actionmesh(localised_dir, output_path, args.seed, stage_0_steps, stage_1_steps)
 
     print("\nDone. Outputs:")
     print(f"  Frames:           {frames_dir}")
     print(f"  SAM2 masks:       {masks_dir}")
     print(f"  Localised frames: {localised_dir}")
+    print(f"  Meshes:           {os.path.join(output_path, 'meshes')}")
+    print(f"  Deformations:     {os.path.join(output_path, 'deformations_vertices.npy')}")
 
 
 if __name__ == "__main__":
