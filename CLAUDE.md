@@ -38,9 +38,13 @@ docker-run --env mvadapter --tag mvadapter <command>
 docker-run --env mvadapter --tag mvadapter-amd64 <command>
 ```
 
-For GPU-dependent commands, either:
-- **Ask the user** to run the command on the server, or
-- **Run via SSH directly**, combining SSH + docker-run. Always include `--non-interactive` when running via SSH — without it, docker-run tries to allocate a TTY and fails with "the input device is not a TTY":
+For GPU-dependent commands, the preferred approach is to send them to the persistent `run_experiments` tmux session on the server:
+```bash
+ssh lambda_instance "tmux send-keys -t run_experiments 'cd ~/repos/ram4d && docker-run --non-interactive --env mvadapter --tag mvadapter python run_wan_fg_anim.py --mask_method sam2' Enter"
+```
+This survives wifi drops and connection interruptions. The user can monitor progress by attaching: `ssh lambda_instance "tmux attach -t run_experiments"`.
+
+Alternatively, run via SSH directly with `--non-interactive` (but this will be killed if the connection drops):
 ```bash
 ssh lambda_instance "cd ~/repos/ram4d && docker-run --non-interactive --env mvadapter --tag mvadapter python run_wan_fg_anim.py --mask_method sam2"
 ```
