@@ -1,3 +1,6 @@
 [submodule "actionmesh"]
 	path = actionmesh
 	url = git@github.com:ebartrum/actionmesh.git
+[submodule "Inpaint360GS"]
+	path = Inpaint360GS
+	url = git@github.com:ebartrum/Inpaint360GS.git
