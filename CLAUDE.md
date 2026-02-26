@@ -21,7 +21,7 @@ Code is **edited locally** (on this machine) and **executed remotely** on a GPU 
 
 Use `rsync` to push local changes to the server before running anything:
 ```bash
-rsync -av --exclude='.git' --exclude='data' --exclude='output' \
+rsync -av --exclude='.git' --exclude='/data' --exclude='/output' \
   /home/ed/Documents/repos/ram4d/ lambda_instance:~/repos/ram4d/
 ```
 (Data and output directories are large and live only on the server — do not sync them back.)
