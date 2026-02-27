@@ -4,3 +4,9 @@
 [submodule "Inpaint360GS"]
 	path = Inpaint360GS
 	url = git@github.com:ebartrum/Inpaint360GS.git
+[submodule "Wan2.1"]
+	path = Wan2.1
+	url = https://github.com/andreasjansson/Wan2.1.git
+[submodule "official_wan_repo"]
+	path = official_wan_repo
+	url = https://github.com/Wan-Video/Wan2.1.git
