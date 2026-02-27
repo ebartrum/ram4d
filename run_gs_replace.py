@@ -168,6 +168,45 @@ def render_background(bg_ply_path, minicam, width, height):
     return Image.fromarray(img_np)
 
 
+def interpolate_cameras(cam_a, cam_b, t):
+    """Interpolate between two cam_info dicts at parameter t ∈ [0, 1].
+    Uses SLERP for rotation and linear interpolation for translation and FOV.
+    """
+    from scipy.spatial.transform import Rotation, Slerp
+    T = (1 - t) * cam_a["T"] + t * cam_b["T"]
+    rots = Rotation.from_matrix(np.stack([cam_a["R"], cam_b["R"]]))
+    R = Slerp([0, 1], rots)(t).as_matrix()
+    fovx = (1 - t) * cam_a["fovx"] + t * cam_b["fovx"]
+    return {**cam_a, "R": R, "T": T, "fovx": fovx}
+
+
+def render_background_trajectory(bg_ply_path, start_cam_info, end_cam_info, frame_num, width, height):
+    """Render a smooth camera trajectory from start to end over frame_num frames.
+    Returns (first_frame_pil, bg_video) where bg_video is [3, F, H, W] in [0, 1].
+    """
+    print(f"Loading background PLY for trajectory: {bg_ply_path}")
+    bg_gaussians = GaussianModel(sh_degree=3)
+    bg_gaussians.load_ply(bg_ply_path)
+    bg_color = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
+    pipeline = SimplePipeline()
+
+    frames = []
+    for i in range(frame_num):
+        t = i / (frame_num - 1) if frame_num > 1 else 0.0
+        cam_i = interpolate_cameras(start_cam_info, end_cam_info, t)
+        minicam_i = make_wan_minicam(cam_i, width, height)
+        with torch.no_grad():
+            result = render(minicam_i, bg_gaussians, pipeline, bg_color)
+        frames.append(result["render"].clamp(0, 1).cpu())  # [3, H, W]
+
+    del bg_gaussians
+    torch.cuda.empty_cache()
+
+    bg_video = torch.stack(frames, dim=1)  # [3, F, H, W]
+    first_frame_np = (frames[0].numpy() * 255).astype(np.uint8).transpose(1, 2, 0)
+    return Image.fromarray(first_frame_np), bg_video
+
+
 def render_object_mask(seg_ply_path, classifier_path, minicam, target_obj_id, num_classes, mask_dilation):
     """
     Load seg Gaussians + classifier, render object feature map,
@@ -246,12 +285,15 @@ def run_wan_i2v(
     width, height, frame_num,
     sampling_steps, guide_scale, wan_mask_dilation,
     log_frequency, seed,
+    bg_video_tensor=None,
 ):
     """
     Wan I2V animation with SAM2 mask blending (SAM2 mode from run_wan_fg_anim.py).
-    bg_image: PIL Image (background)
+    bg_image: PIL Image (background, first frame — used for display/Flux only)
     input_image: PIL Image (CLIP visual condition, i.e. Flux output)
     initial_mask_pil: PIL Image mode 'L' (binary mask for SAM2 initialisation)
+    bg_video_tensor: optional [3, F, H, W] float tensor in [0, 1] for dynamic background.
+                     If None, bg_image is repeated as a static background.
     """
     device_id = 0
     rank = 0
@@ -276,10 +318,15 @@ def run_wan_i2v(
     input_img = input_image.resize((width, height))
 
     # ------------------------------------------------------------------
-    # Encode Background to Latents (Static Video)
+    # Encode Background to Latents (static or trajectory)
     # ------------------------------------------------------------------
-    bg_tensor = TF.to_tensor(bg_img).sub_(0.5).div_(0.5).to(device)
-    bg_video = bg_tensor.unsqueeze(1).repeat(1, frame_num, 1, 1).unsqueeze(0)
+    if bg_video_tensor is not None:
+        print("Encoding background trajectory video...")
+        bg_video = bg_video_tensor.sub(0.5).div(0.5).unsqueeze(0).to(device)  # [1, 3, F, H, W]
+    else:
+        print("Encoding background video...")
+        bg_tensor = TF.to_tensor(bg_img).sub_(0.5).div_(0.5).to(device)
+        bg_video = bg_tensor.unsqueeze(1).repeat(1, frame_num, 1, 1).unsqueeze(0)  # [1, 3, F, H, W]
 
     print("Encoding background video...")
     with torch.no_grad():
@@ -582,6 +629,9 @@ def main():
                         help="Object ID to extract as mask from classifier output")
     parser.add_argument("--camera_idx", type=int, default=0,
                         help="Index into sorted training camera list")
+    parser.add_argument("--bg_end_camera_idx", type=int, default=None,
+                        help="If set, render a smooth camera trajectory from --camera_idx to this "
+                             "camera for the background video. Default: static camera.")
     parser.add_argument("--num_classes", type=int, default=256,
                         help="Number of object classes in classifier")
 
@@ -610,8 +660,8 @@ def main():
     parser.add_argument("--wan_mask_dilation", type=int, default=15)
     parser.add_argument("--log_frequency", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--skip_video", action="store_true",
-                        help="Exit after saving bg_render.png, mask_render.png, flux_output.png")
+    parser.add_argument("--skip_video_denoising", action="store_true",
+                        help="Exit after Stage 1 (Flux), without running Wan video denoising")
 
     args = parser.parse_args()
 
@@ -688,7 +738,24 @@ def main():
     )
     print(f"Background PLY: {bg_ply_path} (iter {bg_iter})")
 
-    bg_image = render_background(bg_ply_path, minicam, args.width, args.height)
+    if args.bg_end_camera_idx is not None:
+        end_cam_info = train_cams[args.bg_end_camera_idx]
+        print(f"Trajectory: camera {args.camera_idx} ({cam_info['image_name']}) → "
+              f"camera {args.bg_end_camera_idx} ({end_cam_info['image_name']})")
+        bg_image, bg_video_tensor = render_background_trajectory(
+            bg_ply_path, cam_info, end_cam_info, args.frame_num, args.width, args.height
+        )
+        traj_path = os.path.join(save_dir, "bg_trajectory.mp4")
+        cache_video(
+            tensor=bg_video_tensor.unsqueeze(0),
+            save_file=traj_path,
+            fps=16, nrow=1, normalize=False, value_range=(0, 1)
+        )
+        print(f"Saved background trajectory: {traj_path}")
+    else:
+        bg_image = render_background(bg_ply_path, minicam, args.width, args.height)
+        bg_video_tensor = None
+
     bg_path = os.path.join(save_dir, "bg_render.png")
     bg_image.save(bg_path)
     print(f"Saved background render: {bg_path}")
@@ -713,8 +780,8 @@ def main():
     flux_output.save(flux_path)
     print(f"Saved Flux output: {flux_path}")
 
-    if args.skip_video:
-        print("\nImages saved. Exiting (--skip_video).")
+    if args.skip_video_denoising:
+        print("\nExiting after Stage 1 (--skip_video_denoising).")
         return
 
     # ======================================================================
@@ -737,6 +804,7 @@ def main():
         wan_mask_dilation=args.wan_mask_dilation,
         log_frequency=args.log_frequency,
         seed=args.seed,
+        bg_video_tensor=bg_video_tensor,
     )
 
 
