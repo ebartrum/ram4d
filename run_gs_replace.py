@@ -588,7 +588,7 @@ def main():
                         help="Output subdirectory name under output/")
 
     # Mask
-    parser.add_argument("--mask_dilation", type=int, default=10,
+    parser.add_argument("--mask_dilation", type=int, default=60,
                         help="Dilation on the rendered object mask (pixels)")
 
     # Flux stage
