@@ -586,8 +586,9 @@ def main():
                         help="Number of object classes in classifier")
 
     # New-object inputs
-    parser.add_argument("--prompt_path", type=str, required=True,
-                        help="Path to text prompt file")
+    parser.add_argument("--object_name", type=str, required=True,
+                        help="Object name (e.g. 'corgi'). Loads data/captions/{object_name}_image.txt "
+                             "for Flux and data/captions/{object_name}_video.txt for Wan.")
     parser.add_argument("--output_name", type=str, required=True,
                         help="Output subdirectory name under output/")
 
@@ -624,10 +625,18 @@ def main():
         for k, v in vars(args).items():
             f.write(f"{k}: {v}\n")
 
-    # Load prompt
-    with open(args.prompt_path) as f:
-        prompt = f.read().strip()
-    print(f"Prompt: {prompt}")
+    # Load prompts
+    image_prompt_path = os.path.join("data", "captions", f"{args.object_name}_image.txt")
+    video_prompt_path = os.path.join("data", "captions", f"{args.object_name}_video.txt")
+    for p in (image_prompt_path, video_prompt_path):
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Prompt file not found: {p}")
+    with open(image_prompt_path) as f:
+        image_prompt = f.read().strip()
+    with open(video_prompt_path) as f:
+        video_prompt = f.read().strip()
+    print(f"Image prompt (Flux): {image_prompt}")
+    print(f"Video prompt (Wan):  {video_prompt}")
 
     # ======================================================================
     # Stage 0: 3DGS Rendering
@@ -695,7 +704,7 @@ def main():
     flux_output = run_flux_inpainting(
         bg_image=bg_image,
         mask_image=mask_image,
-        prompt=prompt,
+        prompt=image_prompt,
         guidance_scale=args.flux_guidance,
         num_steps=args.flux_steps,
         seed=args.flux_seed,
@@ -717,7 +726,7 @@ def main():
         bg_image=bg_image,
         input_image=flux_output,
         initial_mask_pil=mask_image,
-        prompt=prompt,
+        prompt=video_prompt,
         save_dir=save_dir,
         mask_dir=mask_dir,
         width=args.width,
