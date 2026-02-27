@@ -64,8 +64,8 @@ def parse_cfg_args(cfg_path):
 
 def make_wan_minicam(cam_info, width=832, height=480):
     """
-    Create a MiniCam at (width x height) from a CameraInfo, preserving square pixels.
-    cam_info has: R (world2cam rotation), T (world2cam translation), FoVx, znear=0.01, zfar=100.
+    Create a MiniCam at (width x height) from a CameraInfo.
+    Keeps the original fovx and adjusts fovy to maintain square pixels at the target resolution.
     """
     fovx = cam_info["fovx"]
     fovy = 2 * math.atan(math.tan(fovx / 2) * height / width)
@@ -112,7 +112,9 @@ def load_cameras_from_colmap(source_path):
             raise ValueError(f"Unsupported COLMAP camera model: {intr.model}")
 
         image_name = os.path.splitext(os.path.basename(extr.name))[0]
-        cams.append({"R": R, "T": T, "fovx": fovx, "fovy": fovy, "image_name": image_name})
+        cams.append({"R": R, "T": T, "fovx": fovx, "fovy": fovy,
+                     "width": intr.width, "height": intr.height,
+                     "image_name": image_name})
 
     # Sort by image_name, filter out test images
     cams = sorted(cams, key=lambda c: c["image_name"])
@@ -673,7 +675,6 @@ def main():
     )
     print(f"Background PLY: {bg_ply_path} (iter {bg_iter})")
 
-    # Render background
     bg_image = render_background(bg_ply_path, minicam, args.width, args.height)
     bg_path = os.path.join(save_dir, "bg_render.png")
     bg_image.save(bg_path)
