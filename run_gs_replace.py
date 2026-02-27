@@ -510,6 +510,8 @@ def run_wan_i2v(
                     mixed_x0 = pred_x0_vis + annealed_bg_debug * (bg_clean - pred_x0_vis)
 
                     print(f"Decoding debug videos at step {i}...")
+                    wan_i2v.model.cpu()
+                    torch.cuda.empty_cache()
                     vae = tiny_vae if tiny_vae is not None else wan_i2v.vae
                     if tiny_vae is None:
                         wan_i2v.vae.model.to(device)
@@ -533,6 +535,8 @@ def run_wan_i2v(
                         fps=16, nrow=1, normalize=True, value_range=(-1, 1)
                     )
                     del decoded_mixed
+                    wan_i2v.model.to(device)
+                    torch.cuda.empty_cache()
 
             # ------------------------------------------------------------------
             # Background blending
