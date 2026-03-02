@@ -62,7 +62,7 @@ def parse_args():
     )
     parser.add_argument(
         "--sigma", type=float, default=0.65,
-        help="mesh2splat Gaussian spread in UV space (default: 0.65)."
+        help="Fraction of the average 3D triangle edge length used as Gaussian scale (default: 0.65)."
     )
     return parser.parse_args()
 
@@ -221,20 +221,13 @@ def compute_per_triangle_gaussians(mesh, texture_np, sigma):
     dp_mat = np.stack([dp1, dp2], axis=-1)  # (F, 3, 2)
     J = dp_mat @ D_inv  # (F, 3, 2)  J[:,0]=tangent, J[:,1]=bitangent in 3D space
 
-    # --- Scale from Jacobian ---
-    tang_len = np.linalg.norm(J[:, :, 0], axis=-1)   # (F,) length of tangent in 3D
-    bitang_len = np.linalg.norm(J[:, :, 1], axis=-1)  # (F,)
-
-    scale_tang = sigma * tang_len
-    scale_bitang = sigma * bitang_len
-    scale_norm = 0.01 * np.minimum(scale_tang, scale_bitang)
-
-    # Fallback for degenerate UV triangles: use edge lengths
-    edge_len = (np.linalg.norm(dp1, axis=-1) + np.linalg.norm(dp2, axis=-1)) / 2.0
-    fallback_scale = sigma * edge_len
-    scale_tang = np.where(degenerate_uv, fallback_scale, scale_tang)
-    scale_bitang = np.where(degenerate_uv, fallback_scale, scale_bitang)
-    scale_norm = np.where(degenerate_uv, 0.01 * fallback_scale, scale_norm)
+    # --- Scale from 3D edge lengths ---
+    # sigma is a fraction of the average 3D triangle edge length.
+    # Using Jacobian magnitudes (world/UV) would produce scales ~100× too large.
+    edge_len_3d = (np.linalg.norm(dp1, axis=-1) + np.linalg.norm(dp2, axis=-1)) / 2.0
+    scale_tang   = sigma * edge_len_3d
+    scale_bitang = sigma * edge_len_3d
+    scale_norm   = 0.01 * sigma * edge_len_3d
 
     # Clamp scales to avoid log(0)
     scale_tang = np.maximum(scale_tang, 1e-8)
@@ -288,7 +281,7 @@ def compute_per_triangle_gaussians(mesh, texture_np, sigma):
 
     n_degen = int(degenerate_uv.sum()) + int(degenerate_tri.sum())
     if n_degen > 0:
-        print(f"  Degenerate triangles: {n_degen} (used edge-length fallback)")
+        print(f"  Degenerate triangles: {n_degen}")
 
     return {
         "centroid": centroid.astype(np.float32),

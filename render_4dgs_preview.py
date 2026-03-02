@@ -4,8 +4,12 @@ render_4dgs_preview.py — Render 4DGS output as a multi-view preview video.
 Renders 4 orthogonal views side by side (matching the layout of
 textured_dynamic_mesh.mp4): front, right, back, left.
 
-Camera: azimuth_deg=[180, -90, 0, 90], elevation=0, distance=2.2.
-Same orthographic projection as get_orthogonal_camera in mvadapter.
+Uses diff_gaussian_rasterization_inpaint360gs — the same CUDA rasterizer used by
+Inpaint360GS — for standard alpha-compositing Gaussian splatting with transmittance.
+
+Camera: azimuth_deg=[180, -90, 0, 90], elevation=0.
+Camera placed at CAM_DIST=100 with tanfov=HALF_FOV/CAM_DIST for near-orthographic
+projection matching the existing 4-view layout (HALF_FOV=0.55 world units).
 
 Usage:
   python render_4dgs_preview.py --output_path output/2026.03.02/actionmesh_gs_replace_corgi
@@ -38,10 +42,13 @@ import torch
 import imageio
 from plyfile import PlyData
 
+from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+
 C0 = 0.28209479177387814
 
-# Orthographic view half-size (world units), matching get_orthogonal_camera
-HALF_FOV = 0.55
+# Camera placed far away so tanfov = HALF_FOV / CAM_DIST is tiny → near-orthographic.
+CAM_DIST = 100.0
+HALF_FOV  = 0.55   # world-space half-size of the view (matches get_orthogonal_camera)
 
 # 4 views matching texture_actionmesh.py (azimuths=[270,0,90,180], mapped x-90)
 DEFAULT_AZIMUTHS_DEG = [180, -90, 0, 90]
@@ -53,168 +60,122 @@ def parse_args():
     parser.add_argument("--size", type=int, default=768,
                         help="Per-view image size (square). Default 768.")
     parser.add_argument("--fps", type=int, default=16)
-    parser.add_argument("--max_r", type=int, default=10,
-                        help="Max Gaussian splat radius in pixels.")
-    parser.add_argument("--sigma_scale", type=float, default=1.0,
-                        help="Multiplicative scale on Gaussian sigma for visibility.")
     return parser.parse_args()
 
 
 def load_ply(path):
     v = PlyData.read(path).elements[0]
-    xyz     = np.stack([v['x'],     v['y'],     v['z']    ], axis=1).astype(np.float32)
-    f_dc    = np.stack([v['f_dc_0'], v['f_dc_1'], v['f_dc_2']], axis=1).astype(np.float32)
+    xyz    = np.stack([v['x'],     v['y'],     v['z']    ], axis=1).astype(np.float32)
+    f_dc   = np.stack([v['f_dc_0'], v['f_dc_1'], v['f_dc_2']], axis=1).astype(np.float32)
     opacity = v['opacity'].astype(np.float32)
     log_sc  = np.stack([v['scale_0'], v['scale_1'], v['scale_2']], axis=1).astype(np.float32)
-    rot     = np.stack([v['rot_0'],  v['rot_1'],  v['rot_2'],  v['rot_3'] ], axis=1).astype(np.float32)
+    rot     = np.stack([v['rot_0'],  v['rot_1'],  v['rot_2'],  v['rot_3']], axis=1).astype(np.float32)
     return xyz, f_dc, opacity, log_sc, rot
 
 
-def quaternion_to_matrix(q):
-    """(N, 4) wxyz → (N, 3, 3)"""
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    R = torch.stack([
-        1 - 2*(y*y + z*z),  2*(x*y - w*z),      2*(x*z + w*y),
-        2*(x*y + w*z),      1 - 2*(x*x + z*z),   2*(y*z - w*x),
-        2*(x*z - w*y),      2*(y*z + w*x),       1 - 2*(x*x + y*y),
-    ], dim=-1).reshape(-1, 3, 3)
-    return R
-
-
-def precompute_sigma3d(R, scales, sigma_scale=1.0):
-    """Σ3D = R diag(s²) R^T  →  (N, 3, 3)"""
-    s = scales * sigma_scale            # (N, 3)
-    RS = R * (s ** 2)[:, None, :]       # (N, 3, 3): columns of R scaled by s²
-    return RS @ R.transpose(1, 2)       # (N, 3, 3)
-
-
-def sigma2d_for_azimuth(sigma3d, azimuth_deg, W, H):
+def make_view_camera(azimuth_deg, device):
     """
-    Compute per-Gaussian 2D pixel-space covariance for a given camera azimuth.
+    Construct camera matrices for the given azimuth (elevation=0).
 
-    For elevation=0, azimuth θ (radians):
-      Camera right direction (world):  (-sin θ,  cos θ, 0)
-      Camera up direction (world):     (0,       0,     1)
+    Camera at (CAM_DIST·cosθ, CAM_DIST·sinθ, 0) looking toward the origin.
 
-    Pixel projection (world xyz → pixel xy):
-      px = W/2 + (-sin(θ)·x + cos(θ)·y) · kx
-      py = H/2 - z · ky
+    Uses 3DGS/COLMAP convention: camera +Z points INTO the scene (forward), so
+    z_cam > 0 for visible points. This matches the rasterizer (P[3,2]=+1, w_clip=z_cam>0).
 
-    Jacobian J (2×3):
-      J = [[-sin(θ)·kx,  cos(θ)·kx,  0   ],
-           [ 0,           0,          -ky  ]]
+    Camera axes in world space:
+      right:    (-sinθ,  cosθ,  0)
+      up:       (0,      0,     1)   ← world Z is up
+      forward:  (-cosθ,  -sinθ, 0)  ← camera +Z into scene (3DGS convention)
 
-    Σ2D = J · Σ3D · J^T
+    Convention matches Inpaint360GS cameras.py:
+      world_view_transform = W2C.T   (4×4, transposed)
+      full_proj_transform  = world_view_transform @ projection_matrix.T
 
-    Returns:
-        sigma2d_inv: (N, 2, 2)
+    Returns: viewmatrix (4,4), full_proj (4,4), campos (3,), tanfov (float)
     """
     theta = math.radians(azimuth_deg)
-    kx = W / (2.0 * HALF_FOV)
-    ky = H / (2.0 * HALF_FOV)
-    device = sigma3d.device
+    D     = CAM_DIST
+    tanfov = HALF_FOV / D
 
-    J = torch.tensor(
-        [[-math.sin(theta) * kx,  math.cos(theta) * kx,  0.0],
-         [ 0.0,                   0.0,                   -ky]],
-        dtype=torch.float32, device=device
-    )  # (2, 3)
+    # Camera-to-world rotation R  (columns = camera right / up / forward)
+    # Camera +Z = forward = (-cosθ, -sinθ, 0)  [into scene, 3DGS convention]
+    # Camera +Y = (0, 0, -1): rasterizer maps NDC +Y → image bottom, so we flip
+    # up so that world Z+ (up) → cam -Y → NDC -Y → image top.
+    R = np.array([
+        [-math.sin(theta), 0.0, -math.cos(theta)],
+        [ math.cos(theta), 0.0, -math.sin(theta)],
+        [ 0.0,            -1.0,  0.0],
+    ], dtype=np.float32)
 
-    JSigma = J @ sigma3d         # (N, 2, 3)
-    sigma2d = JSigma @ J.T       # (N, 2, 2)
+    # World-to-camera translation: t = -R.T @ cam_pos = (0, 0, +D)
+    t = np.array([0.0, 0.0, D], dtype=np.float32)
 
-    # Small regularizer for numerical stability
-    sigma2d = sigma2d + torch.eye(2, device=device)[None] * 1e-4
+    # W2C 4×4
+    W2C = np.eye(4, dtype=np.float32)
+    W2C[:3, :3] = R.T
+    W2C[:3,  3] = t
 
-    # Batch invert 2×2
-    det = (sigma2d[:, 0, 0] * sigma2d[:, 1, 1]
-           - sigma2d[:, 0, 1] * sigma2d[:, 1, 0]).abs().clamp(min=1e-10)
-    sigma2d_inv = torch.stack([
-         sigma2d[:, 1, 1] / det, -sigma2d[:, 0, 1] / det,
-        -sigma2d[:, 1, 0] / det,  sigma2d[:, 0, 0] / det,
-    ], dim=-1).reshape(-1, 2, 2)
+    # Perspective projection matrix (matches getProjectionMatrix in Inpaint360GS)
+    znear, zfar = 10.0, D * 2.0
+    P = np.zeros((4, 4), dtype=np.float32)
+    P[0, 0] = 1.0 / tanfov
+    P[1, 1] = 1.0 / tanfov
+    P[3, 2] = 1.0
+    P[2, 2] =   zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
 
-    return sigma2d_inv
+    # Both matrices stored transposed, matching cameras.py
+    viewmatrix = torch.from_numpy(W2C.T).float().to(device)
+    proj_t     = torch.from_numpy(P.T  ).float().to(device)
+    full_proj  = (viewmatrix.unsqueeze(0).bmm(proj_t.unsqueeze(0))).squeeze(0)
+
+    campos = torch.tensor(
+        [D * math.cos(theta), D * math.sin(theta), 0.0],
+        dtype=torch.float32, device=device,
+    )
+    return viewmatrix, full_proj, campos, tanfov
 
 
-def render_one_view(positions, sigma2d_inv, colors, alpha_val,
-                    azimuth_deg, W, H, max_r, device):
+def render_view(means3D, colors, opacities, scales, rotations,
+                viewmatrix, full_proj, campos, tanfov, W, H, device):
     """
-    Render a single orthographic view as an (H, W, 3) uint8 numpy image.
-
-    Projection for azimuth θ:
-      cam_x = -sin(θ)·x + cos(θ)·y
-      cam_y = z
-      depth  = cos(θ)·x + sin(θ)·y  (ascending = back-to-front)
-      px = W/2 + cam_x · kx
-      py = H/2 - cam_y · ky
+    Render one view with the Inpaint360GS CUDA rasterizer.
+    Returns (H, W, 3) uint8 numpy image.
     """
-    theta = math.radians(azimuth_deg)
-    kx = W / (2.0 * HALF_FOV)
-    ky = H / (2.0 * HALF_FOV)
+    N = means3D.shape[0]
+    # means2D is (N, 3) zeros — screen-space placeholder (no gradient needed for preview)
+    means2D = torch.zeros(N, 3, device=device, dtype=torch.float32)
 
-    x, y, z = positions[:, 0], positions[:, 1], positions[:, 2]
-    cam_x = -math.sin(theta) * x + math.cos(theta) * y   # (N,)
-    cam_y = z                                              # (N,)
-    depth = math.cos(theta) * x + math.sin(theta) * y    # (N,)
+    raster_settings = GaussianRasterizationSettings(
+        image_height=H,
+        image_width=W,
+        tanfovx=float(tanfov),
+        tanfovy=float(tanfov),
+        bg=torch.ones(3, device=device, dtype=torch.float32),   # white background
+        scale_modifier=1.0,
+        viewmatrix=viewmatrix,
+        projmatrix=full_proj,
+        sh_degree=0,
+        campos=campos,
+        prefiltered=False,
+        debug=False,
+        antialiasing=False,
+    )
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    Hp = H + 2 * max_r
-    Wp = W + 2 * max_r
-
-    cx = W / 2.0 + cam_x * kx + max_r   # (N,) padded image x
-    cy = H / 2.0 - cam_y * ky + max_r   # (N,) padded image y
-
-    cx_int = cx.round().long()
-    cy_int = cy.round().long()
-
-    # Local pixel grid: (k, k, 2) [dx, dy]
-    k = 2 * max_r + 1
-    offs = torch.arange(-max_r, max_r + 1, device=device, dtype=torch.float32)
-    dy_grid, dx_grid = torch.meshgrid(offs, offs, indexing='ij')   # (k, k)
-    d_flat = torch.stack([dx_grid.reshape(-1), dy_grid.reshape(-1)], dim=-1)  # (k², 2)
-    k2 = k * k
-
-    # Mahalanobis: d^T Σ⁻¹ d for all (Gaussian, local_pixel) pairs
-    temp = torch.einsum('nij,kj->nki', sigma2d_inv, d_flat)   # (N, k², 2)
-    mahal = (d_flat[None] * temp).sum(-1).clamp(min=0.0)       # (N, k²)
-
-    gauss_w = torch.exp(-0.5 * mahal)                          # (N, k²)
-    eff_alpha = alpha_val[:, None] * gauss_w                   # (N, k²)
-
-    # Pixel indices in padded image
-    px_all = (cx_int[:, None] + dx_grid.reshape(1, -1).long()).clamp(0, Wp - 1)  # (N, k²)
-    py_all = (cy_int[:, None] + dy_grid.reshape(1, -1).long()).clamp(0, Hp - 1)  # (N, k²)
-    flat_idx = (py_all * Wp + px_all).reshape(-1)              # (N × k²)
-
-    # Contributions
-    color_contrib = (eff_alpha[:, :, None] * colors[:, None, :]).reshape(-1, 3)
-    alpha_contrib = eff_alpha.reshape(-1)
-
-    # Sort back-to-front (ascending depth = farthest first → rendered first)
-    sort_order = torch.argsort(depth, descending=False)        # farthest first
-    sort_order_k2 = (sort_order[:, None] * k2 +
-                     torch.arange(k2, device=device)[None]).reshape(-1)
-    color_contrib = color_contrib[sort_order_k2]
-    alpha_contrib = alpha_contrib[sort_order_k2]
-    flat_idx      = flat_idx[sort_order_k2]
-
-    # Scatter-accumulate
-    img_flat_color = torch.zeros(Hp * Wp, 3, device=device)
-    img_flat_alpha = torch.zeros(Hp * Wp,    device=device)
-    img_flat_color.scatter_add_(0, flat_idx[:, None].expand(-1, 3), color_contrib)
-    img_flat_alpha.scatter_add_(0, flat_idx, alpha_contrib)
-
-    img_color = img_flat_color.view(Hp, Wp, 3)
-    img_alpha = img_flat_alpha.view(Hp, Wp)
-
-    # Composite over white background
-    alpha_norm = (img_alpha / (img_alpha + 1e-8)).clamp(0, 1)
-    color_norm = (img_color / (img_alpha.unsqueeze(-1) + 1e-8)).clamp(0, 1)
-    result = alpha_norm.unsqueeze(-1) * color_norm + (1 - alpha_norm.unsqueeze(-1))
-
-    # Crop padding
-    result = result[max_r:max_r + H, max_r:max_r + W]
-    return (result.cpu().numpy() * 255).astype(np.uint8)
+    rendered_image, _, _ = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=None,
+        colors_precomp=colors,
+        opacities=opacities,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=None,
+    )
+    # rendered_image: (3, H, W) float
+    img = rendered_image.clamp(0.0, 1.0).permute(1, 2, 0)   # (H, W, 3)
+    return (img.cpu().numpy() * 255).astype(np.uint8)
 
 
 def main():
@@ -226,33 +187,30 @@ def main():
     W = H = args.size
     azimuths = DEFAULT_AZIMUTHS_DEG
 
-    print(f"\n--- Loading PLY ---")
+    print("\n--- Loading PLY ---")
     xyz, f_dc, opacity_raw, log_scale, rot_wxyz = load_ply(ply_path)
     N = xyz.shape[0]
     print(f"  N Gaussians: {N}")
 
-    rgb       = np.clip(f_dc * C0 + 0.5, 0.0, 1.0)              # (N, 3)
-    alpha_val = 1.0 / (1.0 + np.exp(-opacity_raw))               # (N,) sigmoid
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"  Device: {device}")
 
+    # Activate parameters (rasterizer expects activated values)
     xyz_t    = torch.from_numpy(xyz).float().to(device)
-    rgb_t    = torch.from_numpy(rgb).float().to(device)
-    alpha_t  = torch.from_numpy(alpha_val).float().to(device)
+    rgb_t    = torch.from_numpy(np.clip(f_dc * C0 + 0.5, 0.0, 1.0)).float().to(device)
+    alpha_t  = torch.from_numpy(
+        1.0 / (1.0 + np.exp(-opacity_raw))
+    ).float().to(device).unsqueeze(1)                          # (N, 1) sigmoid
     scales_t = torch.from_numpy(np.exp(log_scale)).float().to(device)
-    rot_t    = torch.from_numpy(rot_wxyz).float().to(device)
+    rot_t    = torch.from_numpy(rot_wxyz).float().to(device)   # (N, 4) wxyz, already normalised
 
-    # Precompute Σ3D (fixed) and Σ2D_inv per camera azimuth
-    print("--- Precomputing covariances ---")
-    R_mat    = quaternion_to_matrix(rot_t)                        # (N, 3, 3)
-    sigma3d  = precompute_sigma3d(R_mat, scales_t, args.sigma_scale)  # (N, 3, 3)
-
-    sigma2d_invs = []
+    # Precompute per-view cameras
+    print("--- Setting up cameras ---")
+    cameras = []
     for az in azimuths:
-        inv = sigma2d_for_azimuth(sigma3d, az, W, H)
-        sigma2d_invs.append(inv)
-        print(f"  azimuth {az:4d}° → Σ2D_inv ready")
+        vm, fp, cp, tanfov = make_view_camera(az, device)
+        cameras.append((vm, fp, cp, tanfov))
+        print(f"  azimuth {az:4d}° ready  (tanfov={tanfov:.5f})")
 
     # Deformation offsets
     if os.path.exists(offsets_path):
@@ -274,22 +232,26 @@ def main():
             pos = xyz_t + torch.from_numpy(offsets[t]).float().to(device)
 
         view_imgs = []
-        for az, s2d_inv in zip(azimuths, sigma2d_invs):
-            img = render_one_view(pos, s2d_inv, rgb_t, alpha_t,
-                                  az, W, H, args.max_r, device)
+        for az, (vm, fp, cp, tanfov) in zip(azimuths, cameras):
+            img = render_view(pos, rgb_t, alpha_t, scales_t, rot_t,
+                              vm, fp, cp, tanfov, W, H, device)
             view_imgs.append(img)
 
-        # Stitch horizontally (1 row × n_views columns)
         row = np.concatenate(view_imgs, axis=1)   # (H, n_views*W, 3)
         frames.append(row)
 
         if t % 10 == 0:
             print(f"  Frame {t}/{T}")
 
+    # Always save frame 0 as a PNG for quick visual inspection
+    png_path = os.path.join(gaussians_dir, "gaussians_preview_frame0.png")
+    imageio.imwrite(png_path, frames[0])
+    print(f"  Frame 0 PNG: {png_path}")
+
     video_path = os.path.join(gaussians_dir, "gaussians_preview.mp4")
     imageio.mimsave(video_path, frames, fps=args.fps)
     print(f"\nDone. Video: {video_path}")
-    print(f"  {T} frames @ {args.fps} fps, grid {W*n_views}×{H}")
+    print(f"  {T} frames @ {args.fps} fps, grid {W * n_views}×{H}")
 
 
 if __name__ == "__main__":
