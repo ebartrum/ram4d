@@ -124,7 +124,8 @@ def sample_texture_at_uvs(texture_np, uvs):
 
     Args:
         texture_np: (H, W, 3) float32 array in [0, 1]
-        uvs: (N, 2) float32 array in [0, 1] (u, v) where v=0 is top
+        uvs: (N, 2) float32 array in [0, 1] (u, v) in image convention — v=0 at top
+             (load_mesh with flip_uv=True already converts OBJ v=0-at-bottom to this)
     Returns:
         (N, 3) float32 RGB values
     """
@@ -132,12 +133,10 @@ def sample_texture_at_uvs(texture_np, uvs):
     u = uvs[:, 0]
     v = uvs[:, 1]
 
-    # Flip v: UV (0,0) is bottom-left in OBJ convention, image (0,0) is top-left
-    v_img = 1.0 - v
-
-    # Pixel coords
+    # load_mesh(flip_uv=True) already converted v to image convention (v=0 at top),
+    # so sample directly without any additional flip.
     px = u * (W - 1)
-    py = v_img * (H - 1)
+    py = v * (H - 1)
 
     x0 = np.floor(px).astype(np.int32).clip(0, W - 2)
     y0 = np.floor(py).astype(np.int32).clip(0, H - 2)
