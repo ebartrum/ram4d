@@ -23,6 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run LangSAM segmentation on an image.")
     parser.add_argument("--image_path", type=str, default="data/images/flux_inpainted_corgi.png", help="Path to the input image.")
     parser.add_argument("--prompt_path", type=str, default="data/captions/corgi_segmentation.txt", help="Path to the text prompt file.")
+    parser.add_argument("--output_path", type=str, default=None, help="Path to save the output mask. Defaults to <image_dir>/<image_stem>_mask.png.")
     args = parser.parse_args()
 
     print("Loading LangSAM...")
@@ -86,10 +87,13 @@ def main():
                 
             final_mask_img = Image.fromarray((final_mask * 255).astype(np.uint8))
             
-            # Create output path based on input path
-            base_name = os.path.splitext(os.path.basename(image_path))[0]
-            output_dir = os.path.dirname(image_path)
-            output_path = os.path.join(output_dir, f"{base_name}_mask.png")
+            # Create output path based on input path (or use explicit --output_path)
+            if args.output_path is not None:
+                output_path = args.output_path
+            else:
+                base_name = os.path.splitext(os.path.basename(image_path))[0]
+                output_dir = os.path.dirname(image_path)
+                output_path = os.path.join(output_dir, f"{base_name}_mask.png")
             
             final_mask_img.save(output_path)
             print(f"Mask saved to {output_path}")
