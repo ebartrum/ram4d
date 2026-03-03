@@ -1,17 +1,34 @@
 """
-render_composite_4dgs.py — Render composite 4DGS from a COLMAP camera.
+render_composite_4dgs.py — Render composite 4DGS from a COLMAP camera or an orbiting trajectory.
 
 Loads fg_positions_world.npy (produced by create_composite_4dgs.py) and renders
 the background 3DGS + foreground 4DGS together using the Inpaint360GS CUDA rasterizer.
 
 Run create_composite_4dgs.py first to produce gaussians/fg_positions_world.npy.
 
+Modes:
+  Single camera (default):
+    Renders T_fg frames (one per 4DGS animation frame) from a fixed COLMAP camera.
+    --camera_idx selects which camera.
+
+  Orbit (--orbit):
+    Renders a smooth circular orbit around the scene using generate_ellipse_path().
+    --n_frames sets the orbit length; the 4DGS animation loops if n_frames > T_fg.
+
 Usage:
+  # Single camera
   python render_composite_4dgs.py \\
       --output_path output/2026.03.02/actionmesh_gs_replace_corgi \\
       --gs_scene_path Inpaint360GS/data/inpaint360/bag \\
       --gs_model_path output/2026.02.26/inpainted_scene/point_cloud_object_inpaint_virtual \\
       --camera_idx 28
+
+  # Orbit
+  python render_composite_4dgs.py \\
+      --output_path output/2026.03.02/actionmesh_gs_replace_corgi \\
+      --gs_scene_path Inpaint360GS/data/inpaint360/bag \\
+      --gs_model_path output/2026.02.26/inpainted_scene/point_cloud_object_inpaint_virtual \\
+      --orbit [--n_frames 240]
 """
 
 import sys
@@ -59,7 +76,11 @@ def parse_args():
     parser.add_argument("--gs_model_path", required=True,
                         help="Inpaint360GS model dir (contains iteration_N/point_cloud.ply)")
     parser.add_argument("--camera_idx", type=int, default=28,
-                        help="COLMAP camera to render from (0-based, sorted by image name)")
+                        help="COLMAP camera to render from (single-camera mode, default 28)")
+    parser.add_argument("--orbit", action="store_true",
+                        help="Render an orbiting camera trajectory instead of a single camera")
+    parser.add_argument("--n_frames", type=int, default=240,
+                        help="Number of orbit frames (orbit mode only, default 240)")
     parser.add_argument("--render_scale", type=float, default=0.25,
                         help="Scale factor applied to COLMAP camera resolution (default 0.25)")
     parser.add_argument("--fps", type=int, default=16)
@@ -87,7 +108,6 @@ def load_colmap_camera(scene_path, camera_idx):
 
     R_w2c = qvec2rotmat(img.qvec)
     tvec  = np.array(img.tvec, dtype=np.float64)
-    R_c2w = R_w2c.T
     W, H  = int(cam.width), int(cam.height)
 
     if cam.model in ("PINHOLE", "OPENCV"):
@@ -99,7 +119,52 @@ def load_colmap_camera(scene_path, camera_idx):
 
     FoVx = 2.0 * math.atan(W / (2.0 * fx))
     FoVy = 2.0 * math.atan(H / (2.0 * fy))
-    return R_c2w, tvec, FoVx, FoVy, W, H
+
+    # Single camera: one W2C pose, repeated for each fg animation frame
+    pose_w2c = np.eye(4, dtype=np.float64)
+    pose_w2c[:3, :3] = R_w2c
+    pose_w2c[:3,  3] = tvec
+    return [pose_w2c], FoVx, FoVy, W, H
+
+
+class _SimpleCamera:
+    """Minimal stub for generate_ellipse_path — needs R (C2W) and T (W2C translation)."""
+    def __init__(self, R_c2w, tvec):
+        self.R = R_c2w
+        self.T = tvec
+
+
+def load_orbit_cameras(scene_path, n_frames):
+    """Generate an orbit trajectory from all COLMAP cameras using generate_ellipse_path."""
+    from utils.pose_utils import generate_ellipse_path
+
+    images_bin  = os.path.join(scene_path, "sparse", "0", "images.bin")
+    cameras_bin = os.path.join(scene_path, "sparse", "0", "cameras.bin")
+    extrinsics = read_extrinsics_binary(images_bin)
+    intrinsics = read_intrinsics_binary(cameras_bin)
+    sorted_images = sorted(extrinsics.values(), key=lambda x: x.name)
+
+    views = [
+        _SimpleCamera(R_c2w=qvec2rotmat(img.qvec).T,
+                      tvec=np.array(img.tvec, dtype=np.float64))
+        for img in sorted_images
+    ]
+
+    # Use camera 0's intrinsics as reference FoV
+    cam0 = intrinsics[sorted_images[0].camera_id]
+    W, H = int(cam0.width), int(cam0.height)
+    if cam0.model in ("PINHOLE", "OPENCV"):
+        fx, fy = cam0.params[0], cam0.params[1]
+    elif cam0.model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
+        fx = fy = cam0.params[0]
+    else:
+        raise ValueError(f"Unsupported COLMAP camera model: {cam0.model}")
+    FoVx = 2.0 * math.atan(W / (2.0 * fx))
+    FoVy = 2.0 * math.atan(H / (2.0 * fy))
+
+    print(f"  Generating orbit from {len(views)} training cameras → {n_frames} frames")
+    poses_w2c = generate_ellipse_path(views, n_frames=n_frames, is_circle=True)
+    return poses_w2c, FoVx, FoVy, W, H
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +185,6 @@ def find_latest_ply(model_path):
 
 
 def load_ply_gs(ply_path):
-    """Load Gaussian Splatting PLY — DC SH only."""
     v = PlyData.read(ply_path).elements[0]
     xyz     = np.stack([v['x'],       v['y'],       v['z']      ], axis=1).astype(np.float32)
     f_dc    = np.stack([v['f_dc_0'],  v['f_dc_1'],  v['f_dc_2'] ], axis=1).astype(np.float32)
@@ -134,10 +198,11 @@ def load_ply_gs(ply_path):
 # Camera matrices
 # ---------------------------------------------------------------------------
 
-def make_colmap_raster_camera(R_c2w, tvec, FoVx, FoVy, W, H, device, znear=0.01, zfar=200.0):
-    """Build viewmatrix / full_proj / campos for the Inpaint360GS rasterizer."""
-    R_w2c = R_c2w.T.astype(np.float32)
-    t     = tvec.astype(np.float32)
+def make_raster_camera(pose_w2c, FoVx, FoVy, W, H, device, znear=0.01, zfar=200.0):
+    """Build viewmatrix / full_proj / campos from a 4×4 W2C pose matrix."""
+    R_w2c = pose_w2c[:3, :3].astype(np.float32)
+    t     = pose_w2c[:3, 3].astype(np.float32)
+    R_c2w = R_w2c.T
 
     W2C = np.eye(4, dtype=np.float32)
     W2C[:3, :3] = R_w2c
@@ -156,11 +221,7 @@ def make_colmap_raster_camera(R_c2w, tvec, FoVx, FoVy, W, H, device, znear=0.01,
     viewmatrix = torch.from_numpy(W2C.T).float().to(device)
     proj_t     = torch.from_numpy(P.T  ).float().to(device)
     full_proj  = (viewmatrix.unsqueeze(0).bmm(proj_t.unsqueeze(0))).squeeze(0)
-
-    campos = torch.tensor(
-        -(R_c2w.astype(np.float32) @ t),
-        dtype=torch.float32, device=device,
-    )
+    campos     = torch.tensor(-(R_c2w @ t), dtype=torch.float32, device=device)
     return viewmatrix, full_proj, campos, tanfovx, tanfovy
 
 
@@ -216,36 +277,41 @@ def main():
     fg_positions_path = os.path.join(gaussians_dir, "fg_positions_world.npy")
     fg_ply_path       = os.path.join(gaussians_dir, "gaussians.ply")
     placement_path    = os.path.join(gaussians_dir, "placement.json")
-    out_video  = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}.mp4")
-    out_frame0 = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}_frame0.png")
 
-    # --- Foreground positions (pre-computed by create_composite_4dgs.py) ---
+    if args.orbit:
+        out_video  = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames.mp4")
+        out_frame0 = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames_frame0.png")
+    else:
+        out_video  = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}.mp4")
+        out_frame0 = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}_frame0.png")
+
+    # --- Foreground positions ---
     print("\n--- Loading fg_positions_world.npy ---")
-    fg_positions_world = np.load(fg_positions_path)   # (T, N_fg, 3)
-    T, N_fg, _ = fg_positions_world.shape
+    fg_positions_world = np.load(fg_positions_path)   # (T_fg, N_fg, 3)
+    T_fg, N_fg, _ = fg_positions_world.shape
     print(f"  Shape: {fg_positions_world.shape}")
 
     # --- Foreground attributes ---
     print("\n--- Loading foreground Gaussian attributes ---")
     _, f_dc_fg, op_fg, log_sc_fg, rot_fg = load_ply_gs(fg_ply_path)
-    # Scale factor from placement is needed to size the Gaussian extents correctly
     with open(placement_path) as f:
         scale = float(json.load(f)["scale"])
     scales_fg = np.exp(log_sc_fg) * scale
     print(f"  {N_fg:,} Gaussians  scale={scale:.4f}")
 
-    # --- COLMAP camera ---
-    print("\n--- Loading COLMAP camera ---")
-    R_c2w, tvec, FoVx, FoVy, cam_W, cam_H = load_colmap_camera(
-        args.gs_scene_path, args.camera_idx
-    )
+    # --- Camera sequence ---
+    print("\n--- Loading cameras ---")
+    if args.orbit:
+        poses_w2c, FoVx, FoVy, cam_W, cam_H = load_orbit_cameras(
+            args.gs_scene_path, args.n_frames
+        )
+    else:
+        poses_w2c, FoVx, FoVy, cam_W, cam_H = load_colmap_camera(
+            args.gs_scene_path, args.camera_idx
+        )
     W = max(1, int(cam_W * args.render_scale))
     H = max(1, int(cam_H * args.render_scale))
     print(f"  Native {cam_W}×{cam_H} → render {W}×{H}  (scale={args.render_scale})")
-
-    viewmatrix, full_proj, campos, tanfovx, tanfovy = make_colmap_raster_camera(
-        R_c2w, tvec, FoVx, FoVy, W, H, device
-    )
 
     # --- Background GS ---
     print("\n--- Loading background 3DGS ---")
@@ -254,7 +320,7 @@ def main():
     xyz_bg, f_dc_bg, op_bg, log_sc_bg, rot_bg = load_ply_gs(bg_ply)
     print(f"  {len(xyz_bg):,} Gaussians")
 
-    # --- Build GPU tensors (attributes — same across all frames) ---
+    # --- Build GPU attribute tensors (shared across all frames) ---
     print("\n--- Building GPU tensors ---")
     f_dc_all   = np.concatenate([f_dc_bg,  f_dc_fg ], axis=0)
     op_all     = np.concatenate([op_bg,    op_fg   ], axis=0)
@@ -270,27 +336,42 @@ def main():
     print(f"  Total Gaussians: {len(f_dc_all):,}  (bg={len(xyz_bg):,}  fg={N_fg:,})")
     print(f"  GPU memory: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB allocated")
 
+    # --- In single-camera mode, render one frame per fg animation frame.
+    #     In orbit mode, render one frame per orbit pose, looping the fg animation.
+    if args.orbit:
+        n_render = len(poses_w2c)
+        if n_render > T_fg:
+            print(f"\n  4DGS animation ({T_fg} frames) will loop {n_render / T_fg:.1f}x")
+    else:
+        n_render = T_fg   # one orbit pose (the fixed camera), repeated T_fg times
+
     # --- Render ---
-    print(f"\n--- Rendering {T} frames at {W}×{H} ---")
+    print(f"\n--- Rendering {n_render} frames at {W}×{H} ---")
     frames = []
-    for t in range(T):
-        fg_pos_t = torch.from_numpy(fg_positions_world[t]).float().to(device)
+    for i in range(n_render):
+        pose_w2c = poses_w2c[i % len(poses_w2c)]
+        t_fg     = i % T_fg
+
+        viewmat, full_proj, campos, tanfovx, tanfovy = make_raster_camera(
+            pose_w2c, FoVx, FoVy, W, H, device
+        )
+        fg_pos_t = torch.from_numpy(fg_positions_world[t_fg]).float().to(device)
         means3D  = torch.cat([xyz_bg_t, fg_pos_t], dim=0)
 
         img = render_frame(
             means3D, rgb_t, alpha_t, scales_t, rot_t,
-            viewmatrix, full_proj, campos, tanfovx, tanfovy, W, H, device,
+            viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
         )
         frames.append(img)
 
-        if t % 10 == 0:
-            print(f"  Frame {t}/{T}")
+        if i % 20 == 0:
+            print(f"  Frame {i}/{n_render}  (fg frame {t_fg})")
 
     # --- Save ---
     imageio.imwrite(out_frame0, frames[0])
     print(f"\nFrame 0: {out_frame0}")
     imageio.mimsave(out_video, frames, fps=args.fps)
-    print(f"Video:   {out_video}  ({T} frames @ {args.fps} fps  {W}×{H})")
+    print(f"Video:   {out_video}  ({len(frames)} frames @ {args.fps} fps  {W}×{H})")
 
 
 if __name__ == "__main__":
