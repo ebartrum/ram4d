@@ -128,9 +128,11 @@ def load_colmap_camera(scene_path, camera_idx):
 # ---------------------------------------------------------------------------
 
 def find_latest_ply(model_path):
-    pc_dirs = glob.glob(os.path.join(model_path, "point_cloud", "iteration_*"))
+    pc_dirs = glob.glob(os.path.join(model_path, "iteration_*"))
     if not pc_dirs:
-        raise FileNotFoundError(f"No point_cloud/iteration_* in {model_path}")
+        pc_dirs = glob.glob(os.path.join(model_path, "point_cloud", "iteration_*"))
+    if not pc_dirs:
+        raise FileNotFoundError(f"No iteration_* in {model_path}")
     pc_dirs.sort(key=lambda p: int(p.split("_")[-1]))
     ply = os.path.join(pc_dirs[-1], "point_cloud.ply")
     if not os.path.exists(ply):
@@ -291,9 +293,21 @@ def main():
 
     # --- Wan video frame 0 ---
     print("\n--- Loading Wan video frame 0 ---")
-    reader  = imageio.get_reader(wan_video_path)
-    frame0  = next(iter(reader))
-    reader.close()
+    frames_dir = os.path.join(args.output_path, "frames")
+    if os.path.exists(wan_video_path):
+        reader = imageio.get_reader(wan_video_path)
+        frame0 = next(iter(reader))
+        reader.close()
+    elif os.path.isdir(frames_dir):
+        frame_files = sorted(
+            glob.glob(os.path.join(frames_dir, "*.jpg")) +
+            glob.glob(os.path.join(frames_dir, "*.png"))
+        )
+        if not frame_files:
+            raise FileNotFoundError(f"No final_output.mp4 or frame files in {args.output_path}")
+        frame0 = np.array(Image.open(frame_files[0]).convert("RGB"))
+    else:
+        raise FileNotFoundError(f"No final_output.mp4 or frames/ in {args.output_path}")
     wan_H, wan_W = frame0.shape[:2]
     print(f"  Frame: {wan_W}×{wan_H}")
 
