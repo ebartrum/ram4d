@@ -354,6 +354,7 @@ def main():
     # --- Render ---
     print(f"\n--- Rendering {T} frames at {W}×{H} ---")
     frames = []
+    fg_positions_world_list = []
     R_fg_t = torch.from_numpy(R_fg).float().to(device)
     translation_const = torch.from_numpy(translation).float().to(device)
 
@@ -370,6 +371,8 @@ def main():
             fg_pos = xyz_fg_rot_t + off_world + trans_t
         else:
             fg_pos = xyz_fg_rot_t + trans_t
+
+        fg_positions_world_list.append(fg_pos.cpu().numpy())
 
         means3D = torch.cat([xyz_bg_t, fg_pos], dim=0)
 
@@ -390,6 +393,11 @@ def main():
     imageio.mimsave(out_video, frames, fps=args.fps)
     print(f"Video:   {out_video}")
     print(f"  {T} frames @ {args.fps} fps  {W}×{H}")
+
+    fg_positions_world = np.stack(fg_positions_world_list, axis=0)  # (T, N_fg, 3)
+    out_positions = os.path.join(gaussians_dir, "fg_positions_world.npy")
+    np.save(out_positions, fg_positions_world)
+    print(f"FG positions: {out_positions}  shape={fg_positions_world.shape}  dtype={fg_positions_world.dtype}")
 
 
 if __name__ == "__main__":
