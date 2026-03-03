@@ -362,16 +362,66 @@ def main():
     # Scale: 4DGS is normalised to ~1 world unit; use max horizontal/vertical extent
     scale = float(np.max(extent))
 
+    # --- Per-frame translations ---
+    # Re-use the same depth calibration (a, b) — background is static — and run
+    # Depth Anything V2 on every frame to get the world-space corgi centre for each.
+    print("\n--- Computing per-frame translations ---")
+    if os.path.exists(wan_video_path):
+        reader = imageio.get_reader(wan_video_path)
+        all_frames = [f for f in reader]
+        reader.close()
+    else:
+        all_frames = [
+            np.array(Image.open(p).convert("RGB"))
+            for p in frame_files
+        ]
+    all_masks = [
+        np.array(Image.open(p).convert("L")) for p in mask_files
+    ]
+    # Trim to the shorter of frames / masks (should be equal, but guard against mismatches)
+    n_frames = min(len(all_frames), len(all_masks))
+    print(f"  Processing {n_frames} frames …")
+
+    per_frame_translations = []
+    for i in range(n_frames):
+        frame_i = all_frames[i]
+        raw_mask = all_masks[i]
+        fg_i = (raw_mask > 128).astype(np.uint8)
+        if fg_i.shape != (wan_H, wan_W):
+            fg_i = (np.array(
+                Image.fromarray(fg_i * 255).resize((wan_W, wan_H), Image.NEAREST)
+            ) > 128).astype(np.uint8)
+
+        if fg_i.sum() < 10:
+            # No foreground visible — keep previous translation
+            prev = per_frame_translations[-1] if per_frame_translations else centre.tolist()
+            per_frame_translations.append(prev)
+            continue
+
+        mono_i = run_depth_anything(frame_i, processor, da_model, device)
+        calib_i = np.maximum(a * mono_i + b, 0.01).astype(np.float32)
+        centre_i, _ = estimate_placement(
+            calib_i, fg_i, R_c2w, tvec, FoVx, FoVy, wan_W, wan_H
+        )
+        per_frame_translations.append(centre_i.tolist())
+
+        if i % 10 == 0:
+            print(f"  Frame {i}/{n_frames}  centre={np.round(centre_i, 3).tolist()}")
+
+    print(f"  Done — {len(per_frame_translations)} frame translations computed.")
+
     placement = {
         "translation": centre.tolist(),
         "scale":       scale,
         "extent":      extent.tolist(),
         "calibration": {"a": a, "b": b},
         "camera_idx":  args.camera_idx,
+        "per_frame_translations": per_frame_translations,
         "notes": (
-            "translation = world-space centre of foreground bounding box. "
+            "translation = world-space centre of foreground bounding box (frame 0). "
+            "per_frame_translations = per-frame 3D centre from depth estimation. "
             "scale = max bbox extent (4DGS normalised to ~1 unit). "
-            "Apply to 4DGS: p_world = scale * R * p_local + translation."
+            "Apply to 4DGS: p_world = R @ (scale * p_local) + translation_t."
         ),
     }
 

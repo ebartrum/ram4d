@@ -319,11 +319,18 @@ def main():
     R_fg = compute_fg_rotation(translation, cam_center, world_up, args.yaw_deg)
 
     # --- Transform foreground to world space ---
-    # Positions: p_world = R_fg @ (scale * p_local) + translation
-    # Scales:    s_world = scale * s_local  (splat sizes scale with the object)
+    # Base rotated positions (no translation yet — applied per-frame)
+    # p_world_t = xyz_fg_rot + R_fg @ (offsets[t] * scale) + translation_t
     print("\n--- Applying placement transform to foreground ---")
-    xyz_fg_world = (R_fg @ (xyz_fg * scale).T).T + translation
-    scales_fg_world = np.exp(log_sc_fg) * scale   # activated + scaled
+    xyz_fg_rot = (R_fg @ (xyz_fg * scale).T).T      # (N, 3) — rotation + scale, centred at origin
+    scales_fg_world = np.exp(log_sc_fg) * scale      # activated + scaled
+
+    # Per-frame translations (falls back to constant frame-0 translation)
+    per_frame_translations = placement.get("per_frame_translations")
+    if per_frame_translations is not None:
+        print(f"  Using per-frame translations ({len(per_frame_translations)} frames)")
+    else:
+        print("  No per_frame_translations in placement.json — using constant translation")
 
     # --- Concatenate non-position arrays and move to GPU ---
     print("\n--- Building GPU tensors ---")
@@ -338,8 +345,8 @@ def main():
     scales_t = torch.from_numpy(scales_all).float().to(device)
     rot_t    = torch.from_numpy(rot_all).float().to(device)
 
-    xyz_bg_t       = torch.from_numpy(xyz_bg).float().to(device)
-    xyz_fg_world_t = torch.from_numpy(xyz_fg_world).float().to(device)
+    xyz_bg_t    = torch.from_numpy(xyz_bg).float().to(device)
+    xyz_fg_rot_t = torch.from_numpy(xyz_fg_rot).float().to(device)   # rotated+scaled, no translation
 
     print(f"  Total Gaussians: {len(f_dc_all):,}  (bg={len(xyz_bg):,}  fg={len(xyz_fg):,})")
     print(f"  GPU memory: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB allocated")
@@ -348,14 +355,21 @@ def main():
     print(f"\n--- Rendering {T} frames at {W}×{H} ---")
     frames = []
     R_fg_t = torch.from_numpy(R_fg).float().to(device)
+    translation_const = torch.from_numpy(translation).float().to(device)
 
     for t in range(T):
-        if offsets is not None:
-            # Rotate and scale offsets into world space before adding
-            off_world = (R_fg_t @ (torch.from_numpy(offsets[t] * scale).float().to(device)).T).T
-            fg_pos = xyz_fg_world_t + off_world
+        # Per-frame translation (or fall back to constant frame-0 translation)
+        if per_frame_translations is not None and t < len(per_frame_translations):
+            trans_t = torch.tensor(per_frame_translations[t], dtype=torch.float32, device=device)
         else:
-            fg_pos = xyz_fg_world_t
+            trans_t = translation_const
+
+        # Rotated+scaled canonical positions + rotated offsets + per-frame translation
+        if offsets is not None:
+            off_world = (R_fg_t @ (torch.from_numpy(offsets[t] * scale).float().to(device)).T).T
+            fg_pos = xyz_fg_rot_t + off_world + trans_t
+        else:
+            fg_pos = xyz_fg_rot_t + trans_t
 
         means3D = torch.cat([xyz_bg_t, fg_pos], dim=0)
 
