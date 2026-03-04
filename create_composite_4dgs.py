@@ -55,8 +55,14 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_path", required=True,
                         help="ram4d output dir (contains gaussians/ with placement.json)")
-    parser.add_argument("--gs_scene_path", required=True,
-                        help="Inpaint360GS scene dir (contains sparse/0/) — used for world_up and camera orientation")
+    parser.add_argument("--gs_scene_path", default=None,
+                        help="Inpaint360GS scene dir (contains sparse/0/) — required unless "
+                             "--placement_path JSON contains a 'rotation' key")
+    parser.add_argument("--placement_path", default=None,
+                        help="Override placement JSON (e.g. placement_refined.json from "
+                             "refine_frame0.py). Defaults to <output_path>/gaussians/placement.json. "
+                             "If the JSON contains a 'rotation' key (3×3 matrix), that rotation "
+                             "is used directly and --gs_scene_path is not needed.")
     parser.add_argument("--camera_idx", type=int, default=28,
                         help="Camera the foreground faces toward (0-based, sorted by image name)")
     parser.add_argument("--yaw_deg", type=float, default=0.0,
@@ -155,13 +161,15 @@ def main():
     args = parse_args()
 
     gaussians_dir  = os.path.join(args.output_path, "gaussians")
-    placement_path = os.path.join(gaussians_dir, "placement.json")
+    placement_path = (args.placement_path
+                      if args.placement_path is not None
+                      else os.path.join(gaussians_dir, "placement.json"))
     fg_ply_path    = os.path.join(gaussians_dir, "gaussians.ply")
     offsets_path   = os.path.join(gaussians_dir, "deformation_offsets.npy")
     out_path       = os.path.join(gaussians_dir, "fg_positions_world.npy")
 
     # --- Placement ---
-    print("\n--- Loading placement.json ---")
+    print(f"\n--- Loading placement: {placement_path} ---")
     with open(placement_path) as f:
         placement = json.load(f)
     translation = np.array(placement["translation"], dtype=np.float32)
@@ -172,9 +180,23 @@ def main():
     if per_frame_translations:
         print(f"  per_frame_translations: {len(per_frame_translations)} frames")
 
-    # --- COLMAP cameras (world_up + camera centre for orientation) ---
-    print("\n--- Loading COLMAP cameras ---")
-    world_up, cam_center = load_colmap_cameras(args.gs_scene_path, args.camera_idx)
+    # --- Foreground rotation ---
+    # Use rotation from placement JSON if present (e.g. from refine_frame0.py),
+    # otherwise compute from COLMAP cameras (requires --gs_scene_path).
+    rotation_from_json = placement.get("rotation")
+    if rotation_from_json is not None:
+        print("\n--- Using rotation from placement JSON ---")
+        R_fg = np.array(rotation_from_json, dtype=np.float32)
+        print(f"  R_fg det={np.linalg.det(R_fg):.4f}")
+    else:
+        if args.gs_scene_path is None:
+            raise ValueError(
+                "--gs_scene_path is required when placement JSON has no 'rotation' key"
+            )
+        print("\n--- Loading COLMAP cameras ---")
+        world_up, cam_center = load_colmap_cameras(args.gs_scene_path, args.camera_idx)
+        print("\n--- Computing foreground orientation ---")
+        R_fg = compute_fg_rotation(translation, cam_center, world_up, args.yaw_deg)
 
     # --- Foreground 4DGS ---
     print("\n--- Loading foreground 4DGS ---")
@@ -182,10 +204,6 @@ def main():
     offsets = np.load(offsets_path) if os.path.exists(offsets_path) else None
     T = offsets.shape[0] if offsets is not None else 1
     print(f"  {len(xyz_fg):,} Gaussians  |  {T} frames")
-
-    # --- Foreground rotation ---
-    print("\n--- Computing foreground orientation ---")
-    R_fg = compute_fg_rotation(translation, cam_center, world_up, args.yaw_deg)
 
     # --- Compute per-frame world-space positions ---
     print(f"\n--- Computing {T} frames of world-space positions ---")
