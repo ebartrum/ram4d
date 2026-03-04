@@ -64,6 +64,7 @@ from plyfile import PlyData
 
 from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from camera_utils import make_raster_camera_at_resolution
 
 C0 = 0.28209479177387814
 
@@ -104,31 +105,6 @@ def apply_rigid(xyz_canon_t, R_base_t, t_base_t, s_base, delta_r, delta_t, delta
 # Camera helpers
 # ---------------------------------------------------------------------------
 
-def make_raster_camera(pose_w2c, FoVx, FoVy, W, H, device, znear=0.01, zfar=200.0):
-    """Build viewmatrix / full_proj / campos from a 4×4 W2C pose matrix."""
-    R_w2c = pose_w2c[:3, :3].astype(np.float32)
-    t     = pose_w2c[:3, 3].astype(np.float32)
-    R_c2w = R_w2c.T
-
-    W2C = np.eye(4, dtype=np.float32)
-    W2C[:3, :3] = R_w2c
-    W2C[:3,  3] = t
-
-    tanfovx = math.tan(FoVx / 2.0)
-    tanfovy = math.tan(FoVy / 2.0)
-
-    P = np.zeros((4, 4), dtype=np.float32)
-    P[0, 0] =  1.0 / tanfovx
-    P[1, 1] =  1.0 / tanfovy
-    P[3, 2] =  1.0
-    P[2, 2] =  zfar / (zfar - znear)
-    P[2, 3] = -(zfar * znear) / (zfar - znear)
-
-    viewmatrix = torch.from_numpy(W2C.T).float().to(device)
-    proj_t     = torch.from_numpy(P.T  ).float().to(device)
-    full_proj  = (viewmatrix.unsqueeze(0).bmm(proj_t.unsqueeze(0))).squeeze(0)
-    campos     = torch.tensor(-(R_c2w @ t), dtype=torch.float32, device=device)
-    return viewmatrix, full_proj, campos, tanfovx, tanfovy
 
 
 def load_all_colmap_cameras(scene_path):
@@ -542,29 +518,31 @@ def main():
     # -----------------------------------------------------------------------
     # Source camera
     # -----------------------------------------------------------------------
+    # Reference frame — load first so render resolution matches it
+    # -----------------------------------------------------------------------
+    # The reference was produced by PIL-resizing the 3DGS render to (W_ref, H_ref)
+    # (e.g. Wan's 832×480 target).  To match that, we render at the same aspect
+    # ratio by using rW = W_ref * render_scale, rH = H_ref * render_scale while
+    # keeping the camera's tanfovx / tanfovy unchanged.  The GaussianRasterizer
+    # produces identical content to a render-then-PIL-resize pipeline.
+    print("\n--- Loading reference frame ---")
+    ref_img = np.array(Image.open(args.reference_frame).convert("RGB"))
+    W_ref, H_ref = ref_img.shape[1], ref_img.shape[0]
+    rW = max(1, round(W_ref * args.render_scale))
+    rH = max(1, round(H_ref * args.render_scale))
+    ref_img_r = np.array(Image.fromarray(ref_img).resize((rW, rH), Image.BILINEAR))
+    ref_t = torch.from_numpy(ref_img_r.astype(np.float32) / 255.0).to(device).permute(2, 0, 1)
+    print(f"  Reference: {W_ref}×{H_ref} → render {rW}×{rH}")
+
+    # -----------------------------------------------------------------------
     print("\n--- Loading source camera ---")
     all_cams = load_all_colmap_cameras(args.gs_scene_path)
     if args.camera_idx >= len(all_cams):
         raise ValueError(f"camera_idx {args.camera_idx} out of range ({len(all_cams)})")
     src_pose_w2c, src_FoVx, src_FoVy, src_W, src_H = all_cams[args.camera_idx]
-    rW = max(1, int(src_W * args.render_scale))
-    rH = max(1, int(src_H * args.render_scale))
-    src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy = make_raster_camera(
-        src_pose_w2c, src_FoVx, src_FoVy, rW, rH, device
-    )
-    print(f"  Source cam {args.camera_idx}: {src_W}×{src_H} → render {rW}×{rH}")
-
-    # -----------------------------------------------------------------------
-    # Reference frame (resized to render resolution)
-    # -----------------------------------------------------------------------
-    print("\n--- Loading reference frame ---")
-    ref_img = np.array(Image.open(args.reference_frame).convert("RGB"))
-    ref_img_r = np.array(
-        Image.fromarray(ref_img).resize((rW, rH), Image.BILINEAR)
-    )
-    ref_t = torch.from_numpy(ref_img_r.astype(np.float32) / 255.0).to(device)  # (H, W, 3)
-    ref_t = ref_t.permute(2, 0, 1)  # (3, H, W)
-    print(f"  Reference: {ref_img.shape[:2]} → {rH}×{rW}")
+    src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy = \
+        make_raster_camera_at_resolution(src_pose_w2c, src_FoVx, rW, rH, device)
+    print(f"  Source cam {args.camera_idx}: {src_W}×{src_H}, fovx={math.degrees(src_FoVx):.1f}° → render {rW}×{rH}")
 
     # -----------------------------------------------------------------------
     # GT silhouette mask (source camera)
@@ -614,9 +592,8 @@ def main():
         for cam_i in selected:
             pose_w2c_i, FoVx_i, FoVy_i, W_i, H_i = all_cams[cam_i]
             W_f, H_f = scale_to_flux_res(W_i, H_i, args.flux_res)
-            viewmat_i, fullproj_i, campos_i, tfovx_i, tfovy_i = make_raster_camera(
-                pose_w2c_i, FoVx_i, FoVy_i, W_f, H_f, device
-            )
+            viewmat_i, fullproj_i, campos_i, tfovx_i, tfovy_i = \
+                make_raster_camera_at_resolution(pose_w2c_i, FoVx_i, W_f, H_f, device)
 
             # Render full composite at initial placement to get fg alpha mask
             with torch.no_grad():
@@ -755,10 +732,11 @@ def main():
         flux_loss = torch.tensor(0.0, device=device)
         if args.flux_weight > 0 and flux_pseudogt_targets:
             cam_info = flux_pseudogt_targets[step % len(flux_pseudogt_targets)]
-            viewmat_f, fullproj_f, campos_f, tfovx_f, tfovy_f = make_raster_camera(
-                cam_info["pose_w2c"], cam_info["FoVx"], cam_info["FoVy"],
-                cam_info["W"], cam_info["H"], device,
-            )
+            viewmat_f, fullproj_f, campos_f, tfovx_f, tfovy_f = \
+                make_raster_camera_at_resolution(
+                    cam_info["pose_w2c"], cam_info["FoVx"],
+                    cam_info["W"], cam_info["H"], device,
+                )
             color_f, depth_f, alpha_f = render_diff(
                 means3D, colors_t, alpha_t, scales_t, rot_t,
                 viewmat_f, fullproj_f, campos_f, tfovx_f, tfovy_f,
