@@ -53,6 +53,7 @@ from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from wan.modules.attention import ATTENTION_STORE, capture_attention
 from taehv import WanCompatibleTAEHV
 from sam2.build_sam import build_sam2_video_predictor
+from camera_utils import make_minicam_at_resolution
 
 
 def parse_cfg_args(cfg_path):
@@ -61,24 +62,6 @@ def parse_cfg_args(cfg_path):
         ns = eval(f.read())
     return vars(ns)
 
-
-def make_wan_minicam(cam_info, width=832, height=480):
-    """
-    Create a MiniCam at (width x height) from a CameraInfo.
-    Keeps the original fovx and adjusts fovy to maintain square pixels at the target resolution.
-    """
-    fovx = cam_info["fovx"]
-    fovy = 2 * math.atan(math.tan(fovx / 2) * height / width)
-    znear, zfar = 0.01, 100.0
-
-    world_view_transform = torch.tensor(
-        getWorld2View2(cam_info["R"], cam_info["T"])
-    ).transpose(0, 1).cuda()
-
-    proj = getProjectionMatrix(znear=znear, zfar=zfar, fovX=fovx, fovY=fovy).transpose(0, 1).cuda()
-    full_proj = world_view_transform.unsqueeze(0).bmm(proj.unsqueeze(0)).squeeze(0)
-
-    return MiniCam(width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj)
 
 
 def load_cameras_from_colmap(source_path):
@@ -194,7 +177,7 @@ def render_background_trajectory(bg_ply_path, start_cam_info, end_cam_info, fram
     for i in range(frame_num):
         t = i / (frame_num - 1) if frame_num > 1 else 0.0
         cam_i = interpolate_cameras(start_cam_info, end_cam_info, t)
-        minicam_i = make_wan_minicam(cam_i, width, height)
+        minicam_i = make_minicam_at_resolution(cam_i, width, height)
         with torch.no_grad():
             result = render(minicam_i, bg_gaussians, pipeline, bg_color)
         frames.append(result["render"].clamp(0, 1).cpu())  # [3, H, W]
@@ -707,7 +690,7 @@ def main():
     cam_info = train_cams[args.camera_idx]
     print(f"Using camera {args.camera_idx}: {cam_info['image_name']}")
 
-    minicam = make_wan_minicam(cam_info, width=args.width, height=args.height)
+    minicam = make_minicam_at_resolution(cam_info, width=args.width, height=args.height)
 
     # Find seg PLY (segmentation-aware model with object features).
     # Try point_cloud_distilled first (Inpaint360GS stage 3 output), then point_cloud.

@@ -25,6 +25,36 @@ import numpy as np
 import torch
 
 
+def make_minicam_at_resolution(cam_info, width, height, znear=0.01, zfar=100.0):
+    """
+    Create an Inpaint360GS MiniCam at (width × height) from a cam_info dict.
+
+    Keeps cam_info["fovx"] and recomputes fovy for square pixels:
+        fovy = 2 * atan(tan(fovx/2) * height / width)
+
+    cam_info must have keys: "fovx", "R" (3×3 rotation c2w), "T" (translation w2c).
+
+    Requires Inpaint360GS to be on sys.path (lazy import).
+    Replaces make_wan_minicam() in run_gs_replace.py.
+    """
+    from scene.cameras import MiniCam
+    from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+
+    fovx = cam_info["fovx"]
+    fovy = 2.0 * math.atan(math.tan(fovx / 2.0) * height / width)
+
+    world_view_transform = torch.tensor(
+        getWorld2View2(cam_info["R"], cam_info["T"])
+    ).transpose(0, 1).cuda()
+
+    proj = getProjectionMatrix(
+        znear=znear, zfar=zfar, fovX=fovx, fovY=fovy
+    ).transpose(0, 1).cuda()
+    full_proj = world_view_transform.unsqueeze(0).bmm(proj.unsqueeze(0)).squeeze(0)
+
+    return MiniCam(width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj)
+
+
 def make_raster_camera_at_resolution(pose_w2c, fovx, width, height, device,
                                      znear=0.01, zfar=200.0):
     """
