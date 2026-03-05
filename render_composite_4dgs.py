@@ -84,6 +84,8 @@ def parse_args():
     parser.add_argument("--render_scale", type=float, default=0.25,
                         help="Scale factor applied to COLMAP camera resolution (default 0.25)")
     parser.add_argument("--fps", type=int, default=16)
+    parser.add_argument("--static", action="store_true",
+                        help="Freeze fg at frame 0 (static placement check, no animation)")
     return parser.parse_args()
 
 
@@ -350,7 +352,7 @@ def main():
     frames = []
     for i in range(n_render):
         pose_w2c = poses_w2c[i % len(poses_w2c)]
-        t_fg     = i % T_fg
+        t_fg     = 0 if args.static else i % T_fg
 
         viewmat, full_proj, campos, tanfovx, tanfovy = make_raster_camera(
             pose_w2c, FoVx, FoVy, W, H, device
