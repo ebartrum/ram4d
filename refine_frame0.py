@@ -1003,12 +1003,9 @@ def main():
         )
 
         if step % args.val_interval == 0 or step == args.n_steps - 1:
-            # Save rendered | reference | depth side-by-side
+            # Save rendered | reference | rendered sil | GT sil
             with torch.no_grad():
                 rendered_np = (rgb_src.detach().cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                depth_np    = depth_src.detach().cpu().squeeze().numpy()   # (H, W)
-                alpha_np    = (alpha_src.detach().cpu().squeeze().numpy()
-                               if alpha_src is not None else None)
                 # Occlusion-aware silhouette via alpha compositing
                 sil_colors_v = torch.zeros_like(colors_t)
                 sil_colors_v[N_bg:] = 1.0
@@ -1018,15 +1015,13 @@ def main():
                     rW, rH, device,
                 )
                 sil_np = (sil_render_v.mean(0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-            depth_colored = colorize_depth(depth_np, alpha_hw=alpha_np)
-            # Silhouette panels: rendered fg silhouette and GT mask (always shown)
             sil_rendered = np.stack([sil_np] * 3, axis=-1)
             if mask_src_t is not None:
                 gt_sil = (mask_src_t.cpu().numpy() > 0.5).astype(np.uint8) * 255
                 gt_sil_rgb = np.stack([gt_sil] * 3, axis=-1)
             else:
                 gt_sil_rgb = np.zeros_like(sil_rendered)
-            panels = [rendered_np, ref_img_r, depth_colored, sil_rendered, gt_sil_rgb]
+            panels = [rendered_np, ref_img_r, sil_rendered, gt_sil_rgb]
             val_img = np.concatenate(panels, axis=1)
             imageio.imwrite(os.path.join(val_dir, f"val_{step:04d}.png"), val_img)
 
