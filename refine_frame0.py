@@ -405,7 +405,7 @@ def parse_args():
     parser.add_argument("--render_scale", type=float, default=0.25,
                         help="Render scale for source camera (default 0.25)")
     # Loss weights
-    parser.add_argument("--photo_weight",      type=float, default=1.0)
+    parser.add_argument("--rgb_weight",         type=float, default=1.0)
     parser.add_argument("--silhouette_weight", type=float, default=0.1)
     parser.add_argument("--depth_weight",      type=float, default=0.0,
                         help="Marigold depth loss weight (default 0, loads Marigold if > 0)")
@@ -691,14 +691,14 @@ def main():
         rgb_src = color_src.clamp(0, 1)  # (3, H, W)
 
         # ---- Photo loss (global L1, or fg-weighted if alpha available) ----
-        photo_loss = (rgb_src - ref_t).abs()  # (3, H, W)
+        rgb_loss = (rgb_src - ref_t).abs()  # (3, H, W)
         if alpha_src is not None:
             fg_weight = alpha_src.detach().clamp(0, 1)  # (1, H, W), no grad
-            photo_loss = (photo_loss * fg_weight).mean()
+            rgb_loss = (rgb_loss * fg_weight).mean()
         else:
-            photo_loss = photo_loss.mean()
+            rgb_loss = rgb_loss.mean()
 
-        total_loss = args.photo_weight * photo_loss
+        total_loss = args.rgb_weight * rgb_loss
 
         # ---- Silhouette BCE (requires alpha — skipped without it) ----
         sil_loss = torch.tensor(0.0, device=device)
@@ -763,7 +763,7 @@ def main():
 
         pbar.set_postfix(
             total=f"{total_loss.item():.4f}",
-            photo=f"{photo_loss.item():.4f}",
+            photo=f"{rgb_loss.item():.4f}",
             sil=f"{sil_loss.item():.4f}",
             depth=f"{depth_loss.item():.4f}",
             flux=f"{flux_loss.item():.4f}",
