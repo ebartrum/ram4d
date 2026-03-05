@@ -60,6 +60,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 import imageio
+from tqdm import tqdm
 from plyfile import PlyData
 
 from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
@@ -668,7 +669,8 @@ def main():
     # Optimisation loop
     # -----------------------------------------------------------------------
     print(f"\n--- Optimising {args.n_steps} steps ---")
-    for step in range(args.n_steps):
+    pbar = tqdm(range(args.n_steps), desc="optimising")
+    for step in pbar:
         optimizer.zero_grad()
 
         # Compute refined fg positions and scales (both depend on delta_s)
@@ -759,17 +761,15 @@ def main():
                 "delta_s": delta_s.data.clone(),
             }
 
+        pbar.set_postfix(
+            total=f"{total_loss.item():.4f}",
+            photo=f"{photo_loss.item():.4f}",
+            sil=f"{sil_loss.item():.4f}",
+            depth=f"{depth_loss.item():.4f}",
+            flux=f"{flux_loss.item():.4f}",
+        )
+
         if step % args.val_interval == 0 or step == args.n_steps - 1:
-            print(
-                f"  step {step:04d}  total={total_loss.item():.4f}"
-                f"  photo={photo_loss.item():.4f}"
-                f"  sil={sil_loss.item():.4f}"
-                f"  depth={depth_loss.item():.4f}"
-                f"  flux={flux_loss.item():.4f}"
-                f"  |Δr|={delta_r.norm().item():.4f}"
-                f"  |Δt|={delta_t.norm().item():.4f}"
-                f"  Δs={delta_s.item():.4f}"
-            )
             # Save rendered | reference | depth side-by-side
             with torch.no_grad():
                 rendered_np = (rgb_src.detach().cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)

@@ -1,0 +1,90 @@
+Placing a 4DGS Object into a 3DGS Scene
+=========================================
+
+The goal is to insert an animated foreground object (represented as a 4D Gaussian Splatting
+model) into a static background scene (represented as a 3D Gaussian Splatting model), such
+that the object appears at a plausible 3D location and scale within the scene. The background
+scene has known camera geometry from COLMAP reconstruction.
+
+The placement pipeline has three stages:
+
+---
+
+Stage 1: Depth Calibration (estimate_fg_placement.py)
+------------------------------------------------------
+We need to know the metric 3D position of the foreground object in the background scene's
+world coordinate system. We do this by calibrating a monocular depth estimator against the
+known geometry of the background Gaussians.
+
+1. Select a source camera (a specific COLMAP camera used to render the Wan video).
+
+2. Project the background Gaussian centres into this camera. This gives us a sparse set of
+   pixels with known metric depth (z in camera space), derived directly from the 3DGS
+   geometry — avoiding any ambiguity from the rasterizer's depth buffer.
+
+3. Run Depth Anything V2 on frame 0 of the Wan video to obtain a dense monocular depth map.
+   This is relative (scale/shift ambiguous).
+
+4. Fit a linear calibration on background pixels:
+       z_metric = a * depth_mono + b
+   using least squares, where z_metric comes from the Gaussian projection (step 2) and
+   depth_mono comes from Depth Anything V2 (step 3). The correlation r measures fit quality.
+
+5. Apply the calibration to the full depth map to obtain metric depth at every pixel.
+
+6. Using the SAM2 foreground mask (from the Wan video), unproject the foreground pixels
+   into 3D world space using the camera intrinsics and the calibrated depth values.
+
+7. Compute the percentile bounding box of the resulting 3D foreground point cloud:
+   - Centre  → translation (3D world-space position of the object)
+   - Extent  → scale (the 4DGS model is normalised to ~1 unit; this tells us how large
+               it should appear in world space)
+
+8. Repeat steps 3–7 on every frame of the Wan video to obtain per-frame translations,
+   capturing the motion of the object across the animation.
+
+All of this is saved to placement.json.
+
+---
+
+Stage 2: Orientation and World-Space Transform (create_composite_4dgs.py)
+--------------------------------------------------------------------------
+The 4DGS model lives in its own local coordinate system. We need to rotate it so that it
+is correctly oriented in the background scene's world coordinate system.
+
+We construct a rotation matrix R with three constraints:
+  - 4DGS local Z axis (up)  →  world up direction
+      (estimated as the mean "up" vector across all COLMAP training cameras)
+  - 4DGS local -X axis (front)  →  direction from the object toward the source camera
+      (projected onto the horizontal plane, so the object faces the camera)
+  - 4DGS local Y axis (right)  →  right, completing the right-handed frame
+
+The world-space position of each foreground Gaussian at frame t is then:
+
+    p_world(t) = R @ (scale * p_local + deformation_offset(t)) + translation(t)
+
+where:
+  - p_local         is the Gaussian's canonical position in the 4DGS local frame
+  - deformation_offset(t)  is the per-frame displacement from the 4DGS animation
+  - scale           is the scalar size factor from placement.json
+  - translation(t)  is the per-frame world-space centre from placement.json
+
+The result is fg_positions_world.npy — shape (T, N_fg, 3) — storing the world-space
+position of every foreground Gaussian at every frame.
+
+---
+
+Stage 3: Rendering (render_composite_4dgs.py)
+----------------------------------------------
+The composite 4DGS is fully described by:
+  - fg_positions_world.npy   — per-frame foreground positions in world space
+  - gaussians.ply            — foreground Gaussian attributes (colour, opacity, scale, rotation)
+  - background point_cloud.ply — the background 3DGS (unchanged)
+
+To render a frame, we simply concatenate the background Gaussians with the foreground
+Gaussians at frame t, and pass the combined set to the Inpaint360GS CUDA rasterizer
+from any desired camera viewpoint.
+
+Because the foreground positions are already in world space, rendering from a novel
+camera requires no additional transform — any COLMAP camera (or generated orbit camera)
+can be used directly.
