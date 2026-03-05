@@ -405,8 +405,8 @@ def parse_args():
                         help="Learning rate for rotation quaternion (default 1e-3)")
     parser.add_argument("--lr_t", type=float, default=1e-2,
                         help="Learning rate for translation (default 1e-2, 10x lr_rot)")
-    parser.add_argument("--lr_s", type=float, default=0.0,
-                        help="Learning rate for log-scale (default 0, frozen)")
+    parser.add_argument("--lr_s", type=float, default=1e-3,
+                        help="Learning rate for log-scale (default 1e-3)")
     parser.add_argument("--render_scale", type=float, default=1.0,
                         help="Render scale for source camera (default 1.0)")
     # Loss weights
