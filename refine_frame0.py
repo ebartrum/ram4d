@@ -329,6 +329,198 @@ def align_depth_affine(depth_pred_np, depth_render_np, fg_mask_np):
     return (s * depth_pred_np + b).astype(np.float32)
 
 
+def compute_crop_bbox(mask_hw, margin=0.3):
+    """
+    Square crop bbox around the fg mask region with fractional margin.
+    Returns (x0, y0, x1, y1) in pixel coordinates, or None if mask is empty.
+    """
+    ys, xs = np.where(mask_hw > 0.5)
+    if len(ys) == 0:
+        return None
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    H, W = mask_hw.shape
+    h, w = y1 - y0, x1 - x0
+    my = max(1, int(h * margin))
+    mx = max(1, int(w * margin))
+    y0, y1 = max(0, y0 - my), min(H, y1 + my)
+    x0, x1 = max(0, x0 - mx), min(W, x1 + mx)
+    # Expand shorter side to make square
+    h, w = y1 - y0, x1 - x0
+    if h < w:
+        pad = (w - h) // 2
+        y0, y1 = max(0, y0 - pad), min(H, y1 + pad)
+    elif w < h:
+        pad = (h - w) // 2
+        x0, x1 = max(0, x0 - pad), min(W, x1 + pad)
+    return x0, y0, x1, y1
+
+
+def compute_depth_target(ref_img_np, fg_mask_hw, bg_depth_hw, marigold_pipe, debug_dir=None):
+    """
+    Pre-compute a metric depth target for fg pixels using Marigold anchored to
+    exact bg depths.
+
+    Strategy:
+      1. Run Marigold on the FULL reference image — the full image contains bg
+         pixels at varied depths (table, walls, chairs) which properly constrains
+         the affine fit. Running on the full image at native resolution avoids
+         distortion (no fixed-size resize).
+      2. Fit affine (scale + offset) using ALL bg pixels in the full image where
+         the exact metric depth is known from the rasterizer.
+      3. Apply affine → metric depth for fg pixels.
+
+    Returns:
+      depth_target_hw: (H, W) float32 — metric depth at fg pixels, 0 elsewhere.
+    """
+    H, W = fg_mask_hw.shape
+
+    # Run Marigold on the full reference image (native resolution, no distortion)
+    print(f"  Running Marigold on full reference image ({W}×{H})")
+    marigold_pred = predict_marigold(marigold_pipe, ref_img_np)  # (H, W) in [0,1]
+
+    # Fit affine using ALL bg pixels (exact metric depth known, fg excluded)
+    # Full-image bg gives varied depths → well-constrained scale+offset
+    bg_valid = (bg_depth_hw > 0) & (fg_mask_hw < 0.5)
+    if bg_valid.sum() < 10:
+        print("  Warning: too few bg pixels — skipping depth loss")
+        return None
+
+    pred_bg = marigold_pred[bg_valid].astype(np.float64)
+    rend_bg = bg_depth_hw[bg_valid].astype(np.float64)
+    # Subsample if too many pixels (regression is slow for millions of points)
+    if len(pred_bg) > 50000:
+        idx = np.random.choice(len(pred_bg), 50000, replace=False)
+        pred_bg, rend_bg = pred_bg[idx], rend_bg[idx]
+    A = np.stack([pred_bg, np.ones_like(pred_bg)], axis=1)
+    (s, b), _, _, _ = np.linalg.lstsq(A, rend_bg, rcond=None)
+    print(f"  Depth affine: scale={s:.4f}  offset={b:.4f}"
+          f"  (fit on {int(bg_valid.sum())} bg pixels)")
+
+    # Apply affine → metric depth map; extract fg pixels only
+    metric_full = (s * marigold_pred + b).astype(np.float32)
+    depth_target_hw = np.where(fg_mask_hw > 0.5, metric_full, 0.0).astype(np.float32)
+
+    fg_vals = depth_target_hw[fg_mask_hw > 0.5]
+    print(f"  Depth target fg: min={fg_vals.min():.3f}  mean={fg_vals.mean():.3f}  max={fg_vals.max():.3f}")
+    bg_vals = bg_depth_hw[bg_valid]
+    print(f"  BG metric depth: min={bg_vals.min():.3f}  mean={bg_vals.mean():.3f}  max={bg_vals.max():.3f}")
+
+    if debug_dir is not None:
+        imageio.imwrite(os.path.join(debug_dir, "depth_target.png"),
+                        colorize_depth(depth_target_hw))
+        imageio.imwrite(os.path.join(debug_dir, "depth_marigold_full.png"),
+                        (np.clip(marigold_pred, 0, 1) * 255).astype(np.uint8))
+
+    return depth_target_hw
+
+
+# ---------------------------------------------------------------------------
+# Marigold SDS depth loss
+# ---------------------------------------------------------------------------
+
+def prepare_sds_components(marigold_pipe, ref_img_np, sds_size, device):
+    """
+    Pre-compute fixed components for Marigold SDS: image latent + text embedding.
+    Called once before the optimisation loop.
+    Returns (img_lat, text_emb) — no-grad tensors on device.
+    """
+    sds_H = sds_W = sds_size
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", enabled=False):
+            # Preprocess reference image → [-1, 1], (1, 3, H', W')
+            ref_pil = Image.fromarray(ref_img_np).resize((sds_W, sds_H), Image.BILINEAR)
+            img_np = np.array(ref_pil).astype(np.float32) / 127.5 - 1.0  # [-1, 1]
+            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
+            img_lat = marigold_pipe.vae.encode(img_tensor).latent_dist.mode()
+            img_lat = img_lat * marigold_pipe.vae.config.scaling_factor
+
+        # Empty-prompt text embedding (Marigold is image-conditioned, no text)
+        try:
+            text_out = marigold_pipe.encode_prompt(
+                prompt="", device=device, num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
+            )
+            text_emb = text_out[0] if isinstance(text_out, tuple) else text_out
+        except Exception:
+            toks = marigold_pipe.tokenizer(
+                "", return_tensors="pt", padding="max_length",
+                max_length=marigold_pipe.tokenizer.model_max_length, truncation=True,
+            )
+            text_emb = marigold_pipe.text_encoder(toks.input_ids.to(device))[0]
+    print(f"  SDS components ready — img_lat {img_lat.shape}, text_emb {text_emb.shape}")
+    return img_lat, text_emb
+
+
+def compute_depth_sds(depth_composite_hw, img_lat, text_emb, marigold_pipe,
+                      device, sds_H, sds_W, t_min=50, t_max=500):
+    """
+    One SDS step using Marigold as a depth prior.
+
+    depth_composite_hw: (H, W) float tensor WITH GRAD
+        Composite depth: bg pixels have fixed bg depth, fg pixels have rendered fg depth.
+    img_lat, text_emb: pre-computed, no grad.
+
+    Gradient flows: SDS grad → depth_lat → VAE encoder → depth_composite_hw
+                    → fg_z_rendered → means3D_fg → delta_t / delta_q / delta_s
+    """
+    import random
+
+    H, W = depth_composite_hw.shape
+
+    # 1. Resize composite depth to SDS resolution (differentiable via interpolate)
+    d = depth_composite_hw.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    d_r = F.interpolate(d, size=(sds_H, sds_W), mode='bilinear', align_corners=False)  # (1,1,H',W')
+
+    # 2. Normalise to [-1, 1] (affine-invariant — Marigold only cares about relative depth)
+    d_min = d_r.detach().min()
+    d_max = d_r.detach().max()
+    d_norm = 2.0 * (d_r - d_min) / (d_max - d_min + 1e-6) - 1.0  # [-1, 1], grad preserved
+    d_vae = d_norm.expand(1, 3, sds_H, sds_W)  # (1, 3, H', W')
+
+    # 3. Encode with VAE (WITH grad — needed so SDS gradient flows back to depth_composite)
+    with torch.amp.autocast("cuda", enabled=False):
+        depth_lat = marigold_pipe.vae.encode(d_vae.float()).latent_dist.mode()
+        depth_lat = depth_lat * marigold_pipe.vae.config.scaling_factor  # (1, 4, H'/8, W'/8)
+
+    # 4. Sample noise level t and noise
+    t_val = random.randint(t_min, t_max)
+    t_b = torch.tensor([t_val], device=device, dtype=torch.long)
+    eps = torch.randn_like(depth_lat)
+
+    # 5. Noisy depth latent
+    noisy_depth = marigold_pipe.scheduler.add_noise(depth_lat.detach(), eps, t_b)
+
+    # 6. U-Net input: [image_latent (4ch) | noisy_depth (4ch)] = 8 channels
+    unet_in = torch.cat([img_lat, noisy_depth], dim=1)
+
+    # 7. Predict noise — no grad through U-Net params
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", enabled=False):
+            noise_pred = marigold_pipe.unet(
+                unet_in.float(), t_b, encoder_hidden_states=text_emb.float(),
+            ).sample  # (1, 4, H'/8, W'/8)
+
+    # 8. Handle v-prediction parameterisation (SD 2.1 uses v_prediction)
+    pred_type = getattr(marigold_pipe.scheduler.config, 'prediction_type', 'epsilon')
+    if pred_type == 'v_prediction':
+        alpha_bar = marigold_pipe.scheduler.alphas_cumprod[t_val].to(device=device, dtype=torch.float32)
+        alpha_t = alpha_bar ** 0.5
+        sigma_t = (1.0 - alpha_bar) ** 0.5
+        # Convert v → epsilon prediction
+        noise_pred = sigma_t * noisy_depth.detach() + alpha_t * noise_pred
+
+    # 9. SDS gradient: push depth_lat toward the data manifold
+    #    grad = eps_hat - eps  (no grad through U-Net)
+    sds_grad = (noise_pred - eps).detach()
+
+    # 10. Inject gradient: d(loss)/d(depth_lat) = sds_grad / N
+    #     .mean() keeps loss O(1) and comparable to other loss terms.
+    loss = (depth_lat * sds_grad).mean()
+
+    return loss
+
+
 # ---------------------------------------------------------------------------
 # Flux Fill pseudo-GT
 # ---------------------------------------------------------------------------
@@ -414,11 +606,20 @@ def parse_args():
     parser.add_argument("--silhouette_weight", type=float, default=1.0)
     parser.add_argument("--depth_weight",      type=float, default=0.0,
                         help="Marigold depth loss weight (default 0, loads Marigold if > 0)")
+    parser.add_argument("--depth_mode", default="sds", choices=["sds", "affine"],
+                        help="'sds': Marigold SDS prior (default); 'affine': L1 to bg-anchored affine target")
+    # SDS settings
+    parser.add_argument("--sds_t_min", type=int, default=50,
+                        help="Min noise timestep for SDS (default 50)")
+    parser.add_argument("--sds_t_max", type=int, default=500,
+                        help="Max noise timestep for SDS (default 500)")
+    parser.add_argument("--sds_size", type=int, default=512,
+                        help="Spatial size for SDS U-Net (square, must be 64-multiple, default 512)")
+    # Affine-mode settings
+    parser.add_argument("--depth_one_sided", action="store_true",
+                        help="(affine mode) One-sided hinge: only penalise when fg is too deep")
     parser.add_argument("--flux_weight",       type=float, default=0.0,
                         help="Flux pseudo-GT loss weight (default 0, loads Flux if > 0)")
-    # Marigold settings
-    parser.add_argument("--depth_update_interval", type=int, default=10,
-                        help="Update Marigold pseudo-GT every N steps (default 10)")
     # Flux settings
     parser.add_argument("--n_flux_cams", type=int, default=4,
                         help="Number of training cameras for Flux pseudo-GT (default 4)")
@@ -660,11 +861,45 @@ def main():
         print(f"  Flux pseudo-GT precomputed for {len(flux_pseudogt_targets)} cameras.")
 
     # -----------------------------------------------------------------------
-    # Marigold
+    # Depth supervision pre-computation
     # -----------------------------------------------------------------------
-    marigold_pipe = None
+    bg_depth_src_t  = None   # (H, W) fixed bg depth at source cam — used by both modes
+    marigold_sds_pipe = None  # kept alive for SDS mode
+    sds_img_lat     = None
+    sds_text_emb    = None
+    depth_fg_target_t = None  # only for affine mode
+
     if args.depth_weight > 0:
-        marigold_pipe = load_marigold(device)
+        if mask_np is None:
+            print("  Warning: --depth_weight > 0 but no mask available — skipping depth loss")
+        else:
+            print("\n--- Pre-computing background depth at source camera ---")
+            with torch.no_grad():
+                _, bg_depth_raw, _ = render_diff(
+                    xyz_bg_t, colors_t[:N_bg], alpha_t[:N_bg], scales_bg_t, rot_t[:N_bg],
+                    src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
+                    rW, rH, device,
+                )
+            bg_depth_src_t = bg_depth_raw.squeeze(0)  # (H, W) tensor, no grad
+
+            if args.depth_mode == 'sds':
+                print(f"\n--- Loading Marigold for SDS (size={args.sds_size}, t=[{args.sds_t_min},{args.sds_t_max}]) ---")
+                marigold_sds_pipe = load_marigold(device)
+                sds_img_lat, sds_text_emb = prepare_sds_components(
+                    marigold_sds_pipe, ref_img_r, args.sds_size, device
+                )
+            else:  # affine
+                print("\n--- Computing Marigold depth target (bg-anchored affine) ---")
+                marigold_pipe = load_marigold(device)
+                depth_target_hw = compute_depth_target(
+                    ref_img_r, fg_mask_gt, bg_depth_src_t.cpu().numpy(),
+                    marigold_pipe, debug_dir=debug_dir,
+                )
+                del marigold_pipe
+                torch.cuda.empty_cache()
+                if depth_target_hw is not None:
+                    depth_fg_target_t = torch.from_numpy(depth_target_hw).float().to(device)
+                    print(f"  Depth target: {int((depth_target_hw > 0).sum())} fg pixels")
 
     # -----------------------------------------------------------------------
     # Rigid parameters + optimiser
@@ -682,7 +917,6 @@ def main():
         {"params": [delta_s], "lr": lr_s},
     ])
 
-    depth_target_t = None   # cached Marigold pseudo-GT (updated every depth_update_interval)
     best_total = float("inf")
     best_state = {"delta_q": delta_q.data.clone(),
                   "delta_t": delta_t.data.clone(),
@@ -743,28 +977,48 @@ def main():
                 )
             total_loss = total_loss + args.silhouette_weight * sil_loss
 
-        # ---- Marigold depth loss ----
+        # ---- Depth loss (Marigold SDS prior or affine target) ----
+        # Common: render fg depth as colour so gradient flows differentiably to delta_t.
+        # SDS mode:   composite with fixed bg depth → Marigold scores the full depth map.
+        # Affine mode: compare fg depth against bg-anchored Marigold affine target (L1/hinge).
         depth_loss = torch.tensor(0.0, device=device)
-        if args.depth_weight > 0 and marigold_pipe is not None:
-            if step % args.depth_update_interval == 0:
-                with torch.no_grad():
-                    rgb_np = (rgb_src.detach().cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                    depth_pred_np = predict_marigold(marigold_pipe, rgb_np)
-                    depth_render_np = depth_src.detach().cpu().squeeze().numpy()
-                    if alpha_src is not None:
-                        fg_mask_d = (alpha_src.detach().cpu().squeeze().numpy() > 0.1)
-                    else:
-                        fg_mask_d = depth_render_np > 0
-                    aligned_np = align_depth_affine(depth_pred_np, depth_render_np, fg_mask_d)
-                    depth_target_t = torch.from_numpy(aligned_np).float().to(device).unsqueeze(0)
+        if args.depth_weight > 0 and bg_depth_src_t is not None and mask_src_t is not None:
+            # Camera-space z for each fg Gaussian (differentiable via means3D_fg)
+            fg_hom = torch.cat([means3D_fg,
+                                 torch.ones(means3D_fg.shape[0], 1, device=device)], dim=1)
+            fg_z = (fg_hom @ src_viewmat)[:, 2]  # (N_fg,) metric depth, has grad
+            fg_z_colors = fg_z.unsqueeze(1).expand(-1, 3).float()  # (N_fg, 3) depth-as-color
+            fg_depth_render, _, _ = render_diff(
+                means3D_fg, fg_z_colors, alpha_t[N_bg:], scales_t[N_bg:], rot_t[N_bg:],
+                src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
+                rW, rH, device,
+            )
+            fg_z_rendered = fg_depth_render[0]  # (H, W) alpha-weighted fg depth, has grad
 
-            if depth_target_t is not None:
-                if alpha_src is not None:
-                    fg_weight_d = (alpha_src.detach() > 0.1).float()  # (1, H, W)
-                else:
-                    fg_weight_d = (depth_src.detach() > 0).float()
-                depth_loss = ((depth_src - depth_target_t.detach()).abs() * fg_weight_d).mean()
+            if args.depth_mode == 'sds' and marigold_sds_pipe is not None:
+                # Composite: fg pixels → fg_z_rendered (grad), bg pixels → bg_depth_src_t (no grad)
+                fg_mask_f = (mask_src_t > 0.5).float()
+                depth_composite = bg_depth_src_t * (1.0 - fg_mask_f) + fg_z_rendered * fg_mask_f
+                depth_loss = compute_depth_sds(
+                    depth_composite, sds_img_lat, sds_text_emb, marigold_sds_pipe,
+                    device, args.sds_size, args.sds_size, args.sds_t_min, args.sds_t_max,
+                )
                 total_loss = total_loss + args.depth_weight * depth_loss
+
+            elif args.depth_mode == 'affine' and depth_fg_target_t is not None:
+                if step == 0:
+                    tgt = depth_fg_target_t[depth_fg_target_t > 0]
+                    print(f"\n  [Depth diag step 0]"
+                          f"  fg_z mean={fg_z.detach().mean():.3f}"
+                          f"  target mean={tgt.mean():.3f}"
+                          f"  one_sided={args.depth_one_sided}")
+                fg_valid = (mask_src_t > 0.5) & (depth_fg_target_t > 0)
+                if fg_valid.sum() > 0:
+                    if args.depth_one_sided:
+                        depth_loss = F.relu(fg_z_rendered[fg_valid] - depth_fg_target_t[fg_valid]).mean()
+                    else:
+                        depth_loss = (fg_z_rendered[fg_valid] - depth_fg_target_t[fg_valid]).abs().mean()
+                    total_loss = total_loss + args.depth_weight * depth_loss
 
         # ---- Flux pseudo-GT loss (cycle through training cameras) ----
         flux_loss = torch.tensor(0.0, device=device)
