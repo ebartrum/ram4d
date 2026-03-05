@@ -24,9 +24,7 @@ Usage:
     --prompt_path     data/captions/corgi.txt \\
     --output_path     output/YYYY.MM.DD/<name>_refined/ \\
     --n_steps         500 \\
-    --flux_weight     1.0 \\
-    --silhouette_weight 0.1 \\
-    --depth_weight    0.1
+    --silhouette_weight 1.0
 """
 
 import sys
@@ -403,17 +401,17 @@ def parse_args():
     parser.add_argument("--n_steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate for all parameters (default for --lr_rot/--lr_t/--lr_s)")
-    parser.add_argument("--lr_rot", type=float, default=None,
-                        help="Learning rate for rotation quaternion (default: --lr)")
-    parser.add_argument("--lr_t", type=float, default=None,
-                        help="Learning rate for translation (default: --lr)")
-    parser.add_argument("--lr_s", type=float, default=None,
-                        help="Learning rate for log-scale (default: --lr)")
-    parser.add_argument("--render_scale", type=float, default=0.25,
-                        help="Render scale for source camera (default 0.25)")
+    parser.add_argument("--lr_rot", type=float, default=1e-3,
+                        help="Learning rate for rotation quaternion (default 1e-3)")
+    parser.add_argument("--lr_t", type=float, default=1e-2,
+                        help="Learning rate for translation (default 1e-2, 10x lr_rot)")
+    parser.add_argument("--lr_s", type=float, default=0.0,
+                        help="Learning rate for log-scale (default 0, frozen)")
+    parser.add_argument("--render_scale", type=float, default=1.0,
+                        help="Render scale for source camera (default 1.0)")
     # Loss weights
     parser.add_argument("--rgb_weight",         type=float, default=1.0)
-    parser.add_argument("--silhouette_weight", type=float, default=0.1)
+    parser.add_argument("--silhouette_weight", type=float, default=1.0)
     parser.add_argument("--depth_weight",      type=float, default=0.0,
                         help="Marigold depth loss weight (default 0, loads Marigold if > 0)")
     parser.add_argument("--flux_weight",       type=float, default=0.0,
@@ -675,9 +673,9 @@ def main():
     delta_q = nn.Parameter(torch.tensor([1., 0., 0., 0.], device=device))
     delta_t = nn.Parameter(torch.zeros(3, device=device))
     delta_s = nn.Parameter(torch.zeros(1, device=device))
-    lr_rot = args.lr_rot if args.lr_rot is not None else args.lr
-    lr_t   = args.lr_t   if args.lr_t   is not None else args.lr
-    lr_s   = args.lr_s   if args.lr_s   is not None else args.lr
+    lr_rot = args.lr_rot
+    lr_t   = args.lr_t
+    lr_s   = args.lr_s
     optimizer = torch.optim.Adam([
         {"params": [delta_q], "lr": lr_rot},
         {"params": [delta_t], "lr": lr_t},
