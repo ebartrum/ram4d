@@ -342,13 +342,19 @@ def prepare_sds_components(marigold_pipe, ref_img_np, sds_size, device):
 def compute_depth_sds(depth_composite_hw, img_lat, text_emb, marigold_pipe,
                       device, sds_H, sds_W, t_min=50, t_max=500):
     """
-    One SDS step using Marigold as a depth prior.
+    Clean-target (pseudo-SDS) depth loss using Marigold as a depth prior.
 
     depth_composite_hw: (H, W) float tensor WITH GRAD
         Composite depth: bg pixels have fixed bg depth, fg pixels have rendered fg depth.
     img_lat, text_emb: pre-computed, no grad.
 
-    Gradient flows: SDS grad → depth_lat → VAE encoder → depth_composite_hw
+    Adds partial noise at level t → z_t, runs Marigold U-Net to recover the clean
+    latent z_0_hat, then minimises ||z_0 − z_0_hat||².
+
+    Lower variance than DreamFusion SDS (deterministic given t); gradient direction
+    is "move rendered depth toward Marigold's clean prediction".
+
+    Gradient flows: loss → depth_lat → VAE encoder → depth_composite_hw
                     → fg_z_rendered → means3D_fg → delta_t / delta_q / delta_s
     """
     import random
@@ -365,45 +371,46 @@ def compute_depth_sds(depth_composite_hw, img_lat, text_emb, marigold_pipe,
     d_norm = 2.0 * (d_r - d_min) / (d_max - d_min + 1e-6) - 1.0  # [-1, 1], grad preserved
     d_vae = d_norm.expand(1, 3, sds_H, sds_W)  # (1, 3, H', W')
 
-    # 3. Encode with VAE (WITH grad — needed so SDS gradient flows back to depth_composite)
+    # 3. Encode with VAE (WITH grad — needed so loss gradient flows back to depth_composite)
     with torch.amp.autocast("cuda", enabled=False):
         depth_lat = marigold_pipe.vae.encode(d_vae.float()).latent_dist.mode()
         depth_lat = depth_lat * marigold_pipe.vae.config.scaling_factor  # (1, 4, H'/8, W'/8)
 
-    # 4. Sample noise level t and noise
+    # 4. Sample noise level t and compute α_t, σ_t
     t_val = random.randint(t_min, t_max)
     t_b = torch.tensor([t_val], device=device, dtype=torch.long)
+    alpha_bar = marigold_pipe.scheduler.alphas_cumprod[t_val].to(device=device, dtype=torch.float32)
+    alpha_t = alpha_bar.sqrt()
+    sigma_t = (1.0 - alpha_bar).sqrt()
+
+    # 5. Noisy latent (detached — z_t does not need grad)
     eps = torch.randn_like(depth_lat)
+    noisy_depth = alpha_t * depth_lat.detach() + sigma_t * eps
 
-    # 5. Noisy depth latent
-    noisy_depth = marigold_pipe.scheduler.add_noise(depth_lat.detach(), eps, t_b)
-
-    # 6. U-Net input: [image_latent (4ch) | noisy_depth (4ch)] = 8 channels
+    # 6. U-Net input: [img_lat | noisy_depth]
     unet_in = torch.cat([img_lat, noisy_depth], dim=1)
 
-    # 7. Predict noise — no grad through U-Net params
+    # 7. Predict (no grad through U-Net)
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=False):
             noise_pred = marigold_pipe.unet(
                 unet_in.float(), t_b, encoder_hidden_states=text_emb.float(),
             ).sample  # (1, 4, H'/8, W'/8)
 
-    # 8. Handle v-prediction parameterisation (SD 2.1 uses v_prediction)
+    # 8. Recover clean latent z_0_hat from U-Net output
     pred_type = getattr(marigold_pipe.scheduler.config, 'prediction_type', 'epsilon')
-    if pred_type == 'v_prediction':
-        alpha_bar = marigold_pipe.scheduler.alphas_cumprod[t_val].to(device=device, dtype=torch.float32)
-        alpha_t = alpha_bar ** 0.5
-        sigma_t = (1.0 - alpha_bar) ** 0.5
-        # Convert v → epsilon prediction
-        noise_pred = sigma_t * noisy_depth.detach() + alpha_t * noise_pred
+    with torch.no_grad():
+        if pred_type == 'v_prediction':
+            # v = α_t * ε - σ_t * z_0  →  z_0_hat = α_t * z_t - σ_t * v
+            z0_hat = alpha_t * noisy_depth - sigma_t * noise_pred
+        elif pred_type == 'epsilon':
+            # ε_hat  →  z_0_hat = (z_t - σ_t * ε_hat) / α_t
+            z0_hat = (noisy_depth - sigma_t * noise_pred) / (alpha_t + 1e-8)
+        else:  # 'sample' — U-Net directly predicts z_0
+            z0_hat = noise_pred
 
-    # 9. SDS gradient: push depth_lat toward the data manifold
-    #    grad = eps_hat - eps  (no grad through U-Net)
-    sds_grad = (noise_pred - eps).detach()
-
-    # 10. Inject gradient: d(loss)/d(depth_lat) = sds_grad / N
-    #     .mean() keeps loss O(1) and comparable to other loss terms.
-    loss = (depth_lat * sds_grad).mean()
+    # 9. Regression loss: move rendered depth latent toward Marigold's clean prediction
+    loss = F.mse_loss(depth_lat, z0_hat.detach())
 
     return loss
 
@@ -929,26 +936,25 @@ def main():
             total_loss = total_loss + args.silhouette_weight * sil_loss
 
         # ---- Depth loss (Marigold SDS prior) ----
-        # Render fg depth as colour (depth-as-color trick, differentiable), composite with
-        # fixed bg depth, then let Marigold's score function push the placement toward a
-        # realistic depth configuration consistent with the reference image.
+        # Render full 3DGS scene with depth-as-color (differentiable via fg Gaussians),
+        # then let Marigold's clean-target loss push the placement toward a realistic
+        # depth configuration consistent with the reference image.
         depth_loss = torch.tensor(0.0, device=device)
         _depth_pred_px = None  # set when using pseudo_sds, for debug viz
         if args.depth_weight > 0 and marigold_sds_pipe is not None and mask_src_t is not None:
-            # Camera-space z for each fg Gaussian (differentiable via means3D_fg)
-            fg_hom = torch.cat([means3D_fg,
-                                 torch.ones(means3D_fg.shape[0], 1, device=device)], dim=1)
-            fg_z = (fg_hom @ src_viewmat)[:, 2]  # (N_fg,) metric depth, has grad
-            fg_z_colors = fg_z.unsqueeze(1).expand(-1, 3).float()  # (N_fg, 3) depth-as-color
-            fg_depth_render, _, _ = render_diff(
-                means3D_fg, fg_z_colors, alpha_t[N_bg:], scales_t[N_bg:], rot_t[N_bg:],
+            # Render ALL Gaussians with depth-as-color so occlusion is handled correctly.
+            # bg Gaussians have no grad (xyz_bg_t is fixed); fg Gaussians have grad via
+            # means3D_fg → delta_t/q/s. The rasterizer alpha-composites them in depth order,
+            # so occluded fg Gaussians (e.g. paws behind the table) are naturally suppressed.
+            all_hom = torch.cat([means3D, torch.ones(means3D.shape[0], 1, device=device)], dim=1)
+            all_z = (all_hom @ src_viewmat)[:, 2]  # (N_total,); fg part has grad
+            all_z_colors = all_z.unsqueeze(1).expand(-1, 3).float()  # (N_total, 3)
+            depth_render, _, _ = render_diff(
+                means3D, all_z_colors, alpha_t, scales_t, rot_t,
                 src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
                 rW, rH, device,
             )
-            fg_z_rendered = fg_depth_render[0]  # (H, W) alpha-weighted fg depth, has grad
-            # Composite: fg pixels → fg_z_rendered (grad), bg pixels → bg_depth_src_t (no grad)
-            fg_mask_f = (mask_src_t > 0.5).float()
-            depth_composite = bg_depth_src_t * (1.0 - fg_mask_f) + fg_z_rendered * fg_mask_f
+            depth_composite = depth_render[0]  # (H, W), occlusion-aware, fg part has grad
             if args.sds_type == "pseudo_sds":
                 depth_loss, _depth_pred_px = compute_depth_pseudo_sds(
                     depth_composite, sds_img_lat, sds_text_emb, marigold_sds_pipe,
