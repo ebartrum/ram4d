@@ -725,11 +725,24 @@ def main():
 
         total_loss = args.rgb_weight * rgb_loss
 
-        # ---- Silhouette BCE (requires alpha — skipped without it) ----
+        # ---- Silhouette loss (occlusion-aware via alpha compositing) ----
+        # Render combined scene: fg=white, bg=black. Alpha compositing naturally
+        # dims fg contribution where bg Gaussians are in front (occlusion).
+        # Differentiable through the standard color backward pass.
         sil_loss = torch.tensor(0.0, device=device)
-        if args.silhouette_weight > 0 and mask_src_t is not None and alpha_src is not None:
-            alpha_sq = alpha_src.squeeze(0).clamp(1e-6, 1 - 1e-6)  # (H, W)
-            sil_loss = F.binary_cross_entropy(alpha_sq, mask_src_t)
+        if args.silhouette_weight > 0 and mask_src_t is not None:
+            sil_colors = torch.zeros_like(colors_t)
+            sil_colors[N_bg:] = 1.0  # fg = white, bg = black
+            sil_render, _, _ = render_diff(
+                means3D, sil_colors, alpha_t, scales_t, rot_t,
+                src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
+                rW, rH, device,
+            )
+            sil_pred = sil_render.mean(0)  # (H, W), in [0, 1]
+            with torch.amp.autocast("cuda", enabled=False):
+                sil_loss = F.binary_cross_entropy(
+                    sil_pred.clamp(1e-6, 1 - 1e-6).float(), mask_src_t.float()
+                )
             total_loss = total_loss + args.silhouette_weight * sil_loss
 
         # ---- Marigold depth loss ----
@@ -803,13 +816,15 @@ def main():
                 depth_np    = depth_src.detach().cpu().squeeze().numpy()   # (H, W)
                 alpha_np    = (alpha_src.detach().cpu().squeeze().numpy()
                                if alpha_src is not None else None)
-                # Fg-only render for silhouette
-                _, depth_fg, _ = render_diff(
-                    means3D_fg, colors_t[N_bg:], alpha_t[N_bg:], scales_t[N_bg:], rot_t[N_bg:],
+                # Occlusion-aware silhouette via alpha compositing
+                sil_colors_v = torch.zeros_like(colors_t)
+                sil_colors_v[N_bg:] = 1.0
+                sil_render_v, _, _ = render_diff(
+                    means3D, sil_colors_v, alpha_t, scales_t, rot_t,
                     src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
                     rW, rH, device,
                 )
-                sil_np = (depth_fg.detach().cpu().squeeze().numpy() > 0).astype(np.uint8) * 255
+                sil_np = (sil_render_v.mean(0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
             depth_colored = colorize_depth(depth_np, alpha_hw=alpha_np)
             # Silhouette panels: rendered fg silhouette and GT mask (always shown)
             sil_rendered = np.stack([sil_np] * 3, axis=-1)
