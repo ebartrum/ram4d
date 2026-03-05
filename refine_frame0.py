@@ -408,6 +408,85 @@ def compute_depth_sds(depth_composite_hw, img_lat, text_emb, marigold_pipe,
     return loss
 
 
+def compute_depth_pseudo_sds(depth_composite_hw, img_lat, text_emb, marigold_pipe,
+                              device, sds_H, sds_W, t_min=50, t_max=500):
+    """
+    Clean-target (pseudo-SDS) depth loss using Marigold as a depth prior.
+
+    Instead of DreamFusion-style SDS (gradient = ε_hat − ε), we:
+      1. Encode rendered depth → z_0 (with grad)
+      2. Add noise at level t → z_t
+      3. Run Marigold U-Net to recover clean latent z_0_hat
+      4. Loss = ||z_0 − z_0_hat||²
+
+    Lower variance than true SDS (deterministic given t), more interpretable:
+    "move rendered depth toward Marigold's clean denoised estimate."
+    """
+    import random
+
+    H, W = depth_composite_hw.shape
+
+    # 1. Resize composite depth to SDS resolution (differentiable via interpolate)
+    d = depth_composite_hw.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    d_r = F.interpolate(d, size=(sds_H, sds_W), mode='bilinear', align_corners=False)
+
+    # 2. Normalise to [-1, 1] (affine-invariant)
+    d_min = d_r.detach().min()
+    d_max = d_r.detach().max()
+    d_norm = 2.0 * (d_r - d_min) / (d_max - d_min + 1e-6) - 1.0
+    d_vae = d_norm.expand(1, 3, sds_H, sds_W)
+
+    # 3. Encode with VAE (no grad — loss is computed in pixel space, not latent space)
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", enabled=False):
+            depth_lat = marigold_pipe.vae.encode(d_vae.float()).latent_dist.mode()
+            depth_lat = depth_lat * marigold_pipe.vae.config.scaling_factor
+
+    # 4. Sample noise level t and compute α_t, σ_t
+    t_val = random.randint(t_min, t_max)
+    t_b = torch.tensor([t_val], device=device, dtype=torch.long)
+    alpha_bar = marigold_pipe.scheduler.alphas_cumprod[t_val].to(device=device, dtype=torch.float32)
+    alpha_t = alpha_bar.sqrt()
+    sigma_t = (1.0 - alpha_bar).sqrt()
+
+    # 5. Noisy latent
+    eps = torch.randn_like(depth_lat)
+    noisy_depth = alpha_t * depth_lat + sigma_t * eps
+
+    # 6. U-Net input: [img_lat | noisy_depth]
+    unet_in = torch.cat([img_lat, noisy_depth], dim=1)
+
+    # 7. Predict (no grad through U-Net)
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", enabled=False):
+            noise_pred = marigold_pipe.unet(
+                unet_in.float(), t_b, encoder_hidden_states=text_emb.float(),
+            ).sample
+
+    # 8. Recover clean latent z_0_hat, then decode to pixel space
+    pred_type = getattr(marigold_pipe.scheduler.config, 'prediction_type', 'epsilon')
+    with torch.no_grad():
+        if pred_type == 'v_prediction':
+            z0_hat = alpha_t * noisy_depth - sigma_t * noise_pred
+        elif pred_type == 'epsilon':
+            z0_hat = (noisy_depth - sigma_t * noise_pred) / (alpha_t + 1e-8)
+        else:  # 'sample'
+            z0_hat = noise_pred
+
+        with torch.amp.autocast("cuda", enabled=False):
+            # Decode to pixel space: output in [-1, 1], same range as d_vae
+            pred_depth_px = marigold_pipe.vae.decode(
+                z0_hat.float() / marigold_pipe.vae.config.scaling_factor
+            ).sample  # (1, 3, sds_H, sds_W)
+
+    # 9. Pixel-space regression loss.
+    # d_vae has grad via d_norm → d_r → depth_composite_hw → fg_z → delta_t.
+    # No grad needed through VAE encode/decode — simpler gradient path.
+    loss = F.mse_loss(d_vae, pred_depth_px.detach())
+
+    return loss, pred_depth_px  # pred_depth_px: (1,3,sds_H,sds_W) in [-1,1], for debug viz
+
+
 # ---------------------------------------------------------------------------
 # Flux Fill pseudo-GT
 # ---------------------------------------------------------------------------
@@ -499,6 +578,9 @@ def parse_args():
                         help="Max noise timestep for SDS (default 500)")
     parser.add_argument("--sds_size", type=int, default=512,
                         help="Spatial size for SDS U-Net (square, must be 64-multiple, default 512)")
+    parser.add_argument("--sds_type", choices=["sds", "pseudo_sds"], default="sds",
+                        help="SDS variant: 'sds' = DreamFusion gradient (default), "
+                             "'pseudo_sds' = regression to Marigold's clean denoised estimate (lower variance)")
     parser.add_argument("--flux_weight",       type=float, default=0.0,
                         help="Flux pseudo-GT loss weight (default 0, loads Flux if > 0)")
     # Flux settings
@@ -527,10 +609,12 @@ def main():
     placement_path = os.path.join(gaussians_dir, "placement.json")
     fg_ply_path    = os.path.join(gaussians_dir, "gaussians.ply")
     out_json       = os.path.join(args.output_path, "placement_refined.json")
-    debug_dir      = os.path.join(args.output_path, "debug")
-    val_dir        = os.path.join(args.output_path, "val")
+    debug_dir       = os.path.join(args.output_path, "debug")
+    val_dir         = os.path.join(args.output_path, "val")
+    depth_debug_dir = os.path.join(args.output_path, "depth_debug")
     os.makedirs(debug_dir, exist_ok=True)
     os.makedirs(val_dir, exist_ok=True)
+    os.makedirs(depth_debug_dir, exist_ok=True)
 
     # -----------------------------------------------------------------------
     # Load placement
@@ -849,6 +933,7 @@ def main():
         # fixed bg depth, then let Marigold's score function push the placement toward a
         # realistic depth configuration consistent with the reference image.
         depth_loss = torch.tensor(0.0, device=device)
+        _depth_pred_px = None  # set when using pseudo_sds, for debug viz
         if args.depth_weight > 0 and marigold_sds_pipe is not None and mask_src_t is not None:
             # Camera-space z for each fg Gaussian (differentiable via means3D_fg)
             fg_hom = torch.cat([means3D_fg,
@@ -864,10 +949,16 @@ def main():
             # Composite: fg pixels → fg_z_rendered (grad), bg pixels → bg_depth_src_t (no grad)
             fg_mask_f = (mask_src_t > 0.5).float()
             depth_composite = bg_depth_src_t * (1.0 - fg_mask_f) + fg_z_rendered * fg_mask_f
-            depth_loss = compute_depth_sds(
-                depth_composite, sds_img_lat, sds_text_emb, marigold_sds_pipe,
-                device, args.sds_size, args.sds_size, args.sds_t_min, args.sds_t_max,
-            )
+            if args.sds_type == "pseudo_sds":
+                depth_loss, _depth_pred_px = compute_depth_pseudo_sds(
+                    depth_composite, sds_img_lat, sds_text_emb, marigold_sds_pipe,
+                    device, args.sds_size, args.sds_size, args.sds_t_min, args.sds_t_max,
+                )
+            else:
+                depth_loss = compute_depth_sds(
+                    depth_composite, sds_img_lat, sds_text_emb, marigold_sds_pipe,
+                    device, args.sds_size, args.sds_size, args.sds_t_min, args.sds_t_max,
+                )
             total_loss = total_loss + args.depth_weight * depth_loss
 
         # ---- Flux pseudo-GT loss (cycle through training cameras) ----
@@ -938,6 +1029,26 @@ def main():
             panels = [rendered_np, ref_img_r, depth_colored, sil_rendered, gt_sil_rgb]
             val_img = np.concatenate(panels, axis=1)
             imageio.imwrite(os.path.join(val_dir, f"val_{step:04d}.png"), val_img)
+
+            # Depth debug image (pseudo_sds only): rendered depth | Marigold target
+            if _depth_pred_px is not None and depth_composite is not None:
+                import matplotlib.cm as cm
+                # Rendered depth: colorize the composite (H, W) depth map
+                rendered_depth_np = depth_composite.detach().cpu().numpy()
+                rendered_depth_col = colorize_depth(rendered_depth_np)  # (H, W, 3) uint8
+                # Marigold target: mean channel from (1,3,sds_H,sds_W) [-1,1] → [0,1] → colormap
+                pred_np = _depth_pred_px.squeeze(0).mean(0).cpu().numpy()  # (sds_H, sds_W)
+                pred_01 = (pred_np.clip(-1, 1) + 1.0) / 2.0  # [0, 1]
+                pred_col = (cm.get_cmap("turbo")(pred_01)[..., :3] * 255).astype(np.uint8)  # (sds_H, sds_W, 3)
+                # Resize pred to match rendered depth resolution for side-by-side comparison
+                pred_col_resized = np.array(
+                    Image.fromarray(pred_col).resize(
+                        (rendered_depth_col.shape[1], rendered_depth_col.shape[0]),
+                        Image.BILINEAR,
+                    )
+                )
+                depth_dbg = np.concatenate([rendered_depth_col, pred_col_resized], axis=1)
+                imageio.imwrite(os.path.join(depth_debug_dir, f"depth_{step:04d}.png"), depth_dbg)
 
     # -----------------------------------------------------------------------
     # Apply best delta to base transform → refined placement
