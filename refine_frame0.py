@@ -66,6 +66,7 @@ from plyfile import PlyData
 from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from camera_utils import make_raster_camera_at_resolution
+from pipeline_utils import run_langsam
 
 C0 = 0.28209479177387814
 
@@ -394,6 +395,9 @@ def parse_args():
                         help="Yaw used in create_composite_4dgs (must match, default 0)")
     parser.add_argument("--mask_path", default=None,
                         help="SAM mask PNG (white=fg) for silhouette loss")
+    parser.add_argument("--seg_prompt_path", default=None,
+                        help="Text prompt file for LangSAM auto-segmentation of reference frame "
+                             "(used if --mask_path is not provided)")
     parser.add_argument("--prompt_path", default=None,
                         help="Text prompt file (.txt) for Flux Fill")
     parser.add_argument("--output_path", required=True,
@@ -549,9 +553,20 @@ def main():
     # GT silhouette mask (source camera)
     # -----------------------------------------------------------------------
     mask_src_t = None
-    if args.silhouette_weight > 0 and args.mask_path:
+    if args.mask_path:
         print("\n--- Loading silhouette mask ---")
         mask_np = np.array(Image.open(args.mask_path).convert("L"))
+    elif args.seg_prompt_path:
+        print("\n--- Auto-segmenting reference frame with LangSAM ---")
+        ref_pil = Image.open(args.reference_frame).convert("RGB")
+        mask_np = run_langsam(ref_pil, args.seg_prompt_path)
+        auto_mask_path = os.path.join(debug_dir, "auto_mask.png")
+        Image.fromarray(mask_np).save(auto_mask_path)
+        print(f"  Auto mask saved to {auto_mask_path}")
+    else:
+        mask_np = None
+
+    if mask_np is not None:
         mask_np_r = np.array(
             Image.fromarray(mask_np).resize((rW, rH), Image.NEAREST)
         )
@@ -776,8 +791,23 @@ def main():
                 depth_np    = depth_src.detach().cpu().squeeze().numpy()   # (H, W)
                 alpha_np    = (alpha_src.detach().cpu().squeeze().numpy()
                                if alpha_src is not None else None)
+                # Fg-only render for silhouette
+                _, depth_fg, _ = render_diff(
+                    means3D_fg, colors_t[N_bg:], alpha_t[N_bg:], scales_t[N_bg:], rot_t[N_bg:],
+                    src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
+                    rW, rH, device,
+                )
+                sil_np = (depth_fg.detach().cpu().squeeze().numpy() > 0).astype(np.uint8) * 255
             depth_colored = colorize_depth(depth_np, alpha_hw=alpha_np)
-            val_img = np.concatenate([rendered_np, ref_img_r, depth_colored], axis=1)  # (H, 3W, 3)
+            # Silhouette panels: rendered fg silhouette and GT mask
+            sil_rendered = np.stack([sil_np] * 3, axis=-1)
+            if mask_src_t is not None:
+                gt_sil = (mask_src_t.cpu().numpy() > 0.5).astype(np.uint8) * 255
+                gt_sil_rgb = np.stack([gt_sil] * 3, axis=-1)
+                panels = [rendered_np, ref_img_r, depth_colored, sil_rendered, gt_sil_rgb]
+            else:
+                panels = [rendered_np, ref_img_r, depth_colored, sil_rendered]
+            val_img = np.concatenate(panels, axis=1)
             imageio.imwrite(os.path.join(val_dir, f"val_{step:04d}.png"), val_img)
 
     # -----------------------------------------------------------------------
@@ -786,8 +816,8 @@ def main():
     print("\n--- Computing refined placement ---")
     with torch.no_grad():
         R_delta = rodrigues(best_state["delta_r"])
-        R_refined = (R_delta @ R_base_t).cpu().numpy().tolist()
-        t_refined = (t_base_t + best_state["delta_t"]).cpu().numpy().tolist()
+        R_refined = (R_delta @ R_base_t).float().cpu().numpy().tolist()
+        t_refined = (t_base_t + best_state["delta_t"]).float().cpu().numpy().tolist()
         s_refined = float(s_base * torch.exp(best_state["delta_s"].squeeze()).item())
 
     print(f"  s_refined:  {s_refined:.4f}  (base {s_base:.4f})")

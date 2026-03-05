@@ -25,7 +25,7 @@ import numpy as np
 import torchvision.transforms.functional as TF
 from contextlib import contextmanager
 import argparse
-from utils import preprocess_mask_image
+from pipeline_utils import preprocess_mask_image
 sys.path.insert(0, os.path.abspath("official_wan_repo"))
 
 import wan

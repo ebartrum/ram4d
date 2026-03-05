@@ -2,6 +2,36 @@ from PIL import Image, ImageFilter
 import numpy as np
 import cv2
 
+
+def run_langsam(image_pil, prompt_path):
+    """Run LangSAM on image_pil using the text prompt in prompt_path.
+    Returns a binary uint8 numpy mask (H, W), values 0 or 255."""
+    from lang_sam import LangSAM
+    with open(prompt_path) as f:
+        text_prompt = f.read().strip()
+    print(f"  Running LangSAM with prompt: '{text_prompt}'")
+    model = LangSAM()
+    results = model.predict([image_pil], [text_prompt])
+    if not results:
+        raise RuntimeError("LangSAM returned no results")
+    result = results[0]
+    if hasattr(result, "masks"):
+        masks = result.masks
+    elif isinstance(result, dict):
+        masks = result["masks"]
+    else:
+        raise RuntimeError(f"Unexpected LangSAM result type: {type(result)}")
+    if hasattr(masks, "cpu"):
+        masks_np = masks.cpu().numpy()
+    else:
+        masks_np = np.array(masks)
+    combined = np.zeros((image_pil.height, image_pil.width), dtype=bool)
+    for mask in masks_np:
+        if mask.ndim == 3:
+            mask = mask[0]
+        combined = np.logical_or(combined, mask)
+    return (combined.astype(np.uint8) * 255)
+
 def preprocess_mask_image(mask_path, dilation_pixels=30):
     """
     Loads a mask image, fills holes using contour filling, and applies dilation.
