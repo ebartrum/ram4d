@@ -1,7 +1,7 @@
 """
 refine_frame0.py — Stage 1: rigid refinement of foreground placement in frame 0.
 
-Optimises 7 parameters: axis-angle Δr (3), translation Δt (3), log-scale Δs (1)
+Optimises 7 parameters: unit-quaternion Δq (4), translation Δt (3), log-scale Δs (1)
 as small corrections applied on top of the coarse placement from placement.json.
 
 Losses (all weighted, only photo is mandatory):
@@ -75,27 +75,24 @@ C0 = 0.28209479177387814
 # Differentiable rigid transform helpers
 # ---------------------------------------------------------------------------
 
-def rodrigues(r):
-    """Axis-angle vector r (3,) → rotation matrix (3,3). Differentiable."""
-    theta = r.norm()
-    if theta.item() < 1e-8:
-        return torch.eye(3, device=r.device, dtype=r.dtype)
-    k = r / theta
-    K = torch.zeros(3, 3, device=r.device, dtype=r.dtype)
-    K[0, 1] = -k[2]; K[0, 2] = k[1]
-    K[1, 0] =  k[2]; K[1, 2] = -k[0]
-    K[2, 0] = -k[1]; K[2, 1] =  k[0]
-    I = torch.eye(3, device=r.device, dtype=r.dtype)
-    return I + torch.sin(theta) * K + (1.0 - torch.cos(theta)) * (K @ K)
+def quat_to_matrix(q):
+    """Unit quaternion [w, x, y, z] → rotation matrix (3,3). Normalises q first."""
+    q = q / q.norm()
+    w, x, y, z = q[0], q[1], q[2], q[3]
+    return torch.stack([
+        1 - 2*(y*y + z*z),     2*(x*y - w*z),     2*(x*z + w*y),
+            2*(x*y + w*z), 1 - 2*(x*x + z*z),     2*(y*z - w*x),
+            2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x*x + y*y),
+    ]).reshape(3, 3)
 
 
-def apply_rigid(xyz_canon_t, R_base_t, t_base_t, s_base, delta_r, delta_t, delta_s):
+def apply_rigid(xyz_canon_t, R_base_t, t_base_t, s_base, delta_q, delta_t, delta_s):
     """
     Apply refined rigid transform to canonical fg positions.
     xyz_canon_t: (N_fg, 3) float32, no grad
-    Returns: means3D_fg (N_fg, 3), grad flows through delta_r/delta_t/delta_s.
+    Returns: means3D_fg (N_fg, 3), grad flows through delta_q/delta_t/delta_s.
     """
-    R_delta = rodrigues(delta_r)                          # (3,3)
+    R_delta = quat_to_matrix(delta_q)                     # (3,3)
     R = R_delta @ R_base_t                                # (3,3)
     s = s_base * torch.exp(delta_s.squeeze())             # scalar
     # p_world = R @ (s * p_canon) + t_refined
@@ -405,7 +402,13 @@ def parse_args():
     # Optimisation
     parser.add_argument("--n_steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3,
-                        help="Learning rate for all parameters")
+                        help="Learning rate for all parameters (default for --lr_rot/--lr_t/--lr_s)")
+    parser.add_argument("--lr_rot", type=float, default=None,
+                        help="Learning rate for rotation quaternion (default: --lr)")
+    parser.add_argument("--lr_t", type=float, default=None,
+                        help="Learning rate for translation (default: --lr)")
+    parser.add_argument("--lr_s", type=float, default=None,
+                        help="Learning rate for log-scale (default: --lr)")
     parser.add_argument("--render_scale", type=float, default=0.25,
                         help="Render scale for source camera (default 0.25)")
     # Loss weights
@@ -596,11 +599,11 @@ def main():
 
         # Initial fg positions at base transform for pseudo-GT rendering
         with torch.no_grad():
-            delta_r0 = torch.zeros(3, device=device)
+            delta_q0 = torch.tensor([1., 0., 0., 0.], device=device)
             delta_t0 = torch.zeros(3, device=device)
             delta_s0 = torch.zeros(1, device=device)
             means3D_fg_init = apply_rigid(
-                xyz_fg_t, R_base_t, t_base_t, s_base, delta_r0, delta_t0, delta_s0
+                xyz_fg_t, R_base_t, t_base_t, s_base, delta_q0, delta_t0, delta_s0
             )
             means3D_init = torch.cat([xyz_bg_t, means3D_fg_init], dim=0)
             scales_init  = torch.cat([scales_bg_t, scales_fg_base_t * s_base], dim=0)
@@ -669,14 +672,21 @@ def main():
     # Rigid parameters + optimiser
     # -----------------------------------------------------------------------
     print("\n--- Initialising optimisation ---")
-    delta_r = nn.Parameter(torch.zeros(3, device=device))
+    delta_q = nn.Parameter(torch.tensor([1., 0., 0., 0.], device=device))
     delta_t = nn.Parameter(torch.zeros(3, device=device))
     delta_s = nn.Parameter(torch.zeros(1, device=device))
-    optimizer = torch.optim.Adam([delta_r, delta_t, delta_s], lr=args.lr)
+    lr_rot = args.lr_rot if args.lr_rot is not None else args.lr
+    lr_t   = args.lr_t   if args.lr_t   is not None else args.lr
+    lr_s   = args.lr_s   if args.lr_s   is not None else args.lr
+    optimizer = torch.optim.Adam([
+        {"params": [delta_q], "lr": lr_rot},
+        {"params": [delta_t], "lr": lr_t},
+        {"params": [delta_s], "lr": lr_s},
+    ])
 
     depth_target_t = None   # cached Marigold pseudo-GT (updated every depth_update_interval)
     best_total = float("inf")
-    best_state = {"delta_r": delta_r.data.clone(),
+    best_state = {"delta_q": delta_q.data.clone(),
                   "delta_t": delta_t.data.clone(),
                   "delta_s": delta_s.data.clone()}
 
@@ -690,7 +700,7 @@ def main():
 
         # Compute refined fg positions and scales (both depend on delta_s)
         means3D_fg = apply_rigid(
-            xyz_fg_t, R_base_t, t_base_t, s_base, delta_r, delta_t, delta_s
+            xyz_fg_t, R_base_t, t_base_t, s_base, delta_q, delta_t, delta_s
         )
         means3D    = torch.cat([xyz_bg_t, means3D_fg], dim=0)
         # Fg Gaussian extents also scale with s_refined (same factor as positions)
@@ -771,17 +781,19 @@ def main():
         if total_loss.item() < best_total:
             best_total = total_loss.item()
             best_state = {
-                "delta_r": delta_r.data.clone(),
+                "delta_q": delta_q.data.clone(),
                 "delta_t": delta_t.data.clone(),
                 "delta_s": delta_s.data.clone(),
             }
 
+        dq_dev = (delta_q.data / delta_q.data.norm() - delta_q.data.new_tensor([1., 0., 0., 0.])).norm()
         pbar.set_postfix(
             total=f"{total_loss.item():.4f}",
             photo=f"{rgb_loss.item():.4f}",
             sil=f"{sil_loss.item():.4f}",
             depth=f"{depth_loss.item():.4f}",
             flux=f"{flux_loss.item():.4f}",
+            dq=f"{dq_dev.item():.4f}",
         )
 
         if step % args.val_interval == 0 or step == args.n_steps - 1:
@@ -799,14 +811,14 @@ def main():
                 )
                 sil_np = (depth_fg.detach().cpu().squeeze().numpy() > 0).astype(np.uint8) * 255
             depth_colored = colorize_depth(depth_np, alpha_hw=alpha_np)
-            # Silhouette panels: rendered fg silhouette and GT mask
+            # Silhouette panels: rendered fg silhouette and GT mask (always shown)
             sil_rendered = np.stack([sil_np] * 3, axis=-1)
             if mask_src_t is not None:
                 gt_sil = (mask_src_t.cpu().numpy() > 0.5).astype(np.uint8) * 255
                 gt_sil_rgb = np.stack([gt_sil] * 3, axis=-1)
-                panels = [rendered_np, ref_img_r, depth_colored, sil_rendered, gt_sil_rgb]
             else:
-                panels = [rendered_np, ref_img_r, depth_colored, sil_rendered]
+                gt_sil_rgb = np.zeros_like(sil_rendered)
+            panels = [rendered_np, ref_img_r, depth_colored, sil_rendered, gt_sil_rgb]
             val_img = np.concatenate(panels, axis=1)
             imageio.imwrite(os.path.join(val_dir, f"val_{step:04d}.png"), val_img)
 
@@ -815,14 +827,16 @@ def main():
     # -----------------------------------------------------------------------
     print("\n--- Computing refined placement ---")
     with torch.no_grad():
-        R_delta = rodrigues(best_state["delta_r"])
+        R_delta = quat_to_matrix(best_state["delta_q"])
         R_refined = (R_delta @ R_base_t).float().cpu().numpy().tolist()
         t_refined = (t_base_t + best_state["delta_t"]).float().cpu().numpy().tolist()
         s_refined = float(s_base * torch.exp(best_state["delta_s"].squeeze()).item())
+        dq_norm = best_state["delta_q"] / best_state["delta_q"].norm()
+        dq_dev  = (dq_norm - dq_norm.new_tensor([1., 0., 0., 0.])).norm().item()
 
     print(f"  s_refined:  {s_refined:.4f}  (base {s_base:.4f})")
     print(f"  t_refined:  {[f'{x:.4f}' for x in t_refined]}")
-    print(f"  |Δr|:       {best_state['delta_r'].norm().item():.4f}")
+    print(f"  |Δq - I|:   {dq_dev:.4f}")
     print(f"  |Δt|:       {best_state['delta_t'].norm().item():.4f}")
     print(f"  Δs:         {best_state['delta_s'].item():.4f}")
 
@@ -849,10 +863,10 @@ def main():
     # -----------------------------------------------------------------------
     print("\n--- Saving debug render ---")
     with torch.no_grad():
-        dr = best_state["delta_r"].to(device)
+        dq = best_state["delta_q"].to(device)
         dt = best_state["delta_t"].to(device)
         ds = best_state["delta_s"].to(device)
-        means3D_fg_ref = apply_rigid(xyz_fg_t, R_base_t, t_base_t, s_base, dr, dt, ds)
+        means3D_fg_ref = apply_rigid(xyz_fg_t, R_base_t, t_base_t, s_base, dq, dt, ds)
         means3D_ref    = torch.cat([xyz_bg_t, means3D_fg_ref], dim=0)
         s_ref          = s_base * torch.exp(ds.squeeze())
         scales_ref     = torch.cat([scales_bg_t, scales_fg_base_t * s_ref], dim=0)
