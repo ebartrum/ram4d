@@ -600,6 +600,13 @@ def parse_args():
     # Validation
     parser.add_argument("--val_interval", type=int, default=50,
                         help="Save validation image every N steps (default 50)")
+    # Phase 2: fg attribute optimisation
+    parser.add_argument("--phase1_steps", type=int, default=300,
+                        help="Rigid-only steps before fg attribute optimisation begins (default 300)")
+    parser.add_argument("--attr_lr", type=float, default=1e-4,
+                        help="Learning rate for fg Gaussian attributes in Phase 2 (default 1e-4)")
+    parser.add_argument("--anchor_weight", type=float, default=0.01,
+                        help="L2 anchor regularisation weight keeping attributes near initial values (default 0.01)")
     return parser.parse_args()
 
 
@@ -667,21 +674,35 @@ def main():
     # Note: fg scales are kept separate so they can be updated when delta_s changes.
     # -----------------------------------------------------------------------
     print("\n--- Building GPU tensors ---")
-    f_dc_all = np.concatenate([f_dc_bg, f_dc_fg], axis=0)
-    op_all   = np.concatenate([op_bg,   op_fg],   axis=0)
-    rot_all  = np.concatenate([rot_bg,  rot_fg],  axis=0)
+    # BG attributes — frozen throughout
+    colors_bg_t = torch.from_numpy(
+        np.clip(f_dc_bg * C0 + 0.5, 0.0, 1.0)
+    ).float().to(device)                                           # (N_bg, 3)
+    alpha_bg_t  = torch.from_numpy(
+        1.0 / (1.0 + np.exp(-op_bg))
+    ).float().to(device).unsqueeze(1)                              # (N_bg, 1)
+    rot_bg_t    = torch.from_numpy(rot_bg).float().to(device)      # (N_bg, 4)
+    scales_bg_t = torch.from_numpy(np.exp(log_sc_bg)).float().to(device)  # (N_bg, 3)
 
-    colors_t = torch.from_numpy(
-        np.clip(f_dc_all * C0 + 0.5, 0.0, 1.0)
-    ).float().to(device)
-    alpha_t  = torch.from_numpy(
-        1.0 / (1.0 + np.exp(-op_all))
-    ).float().to(device).unsqueeze(1)
-    rot_t    = torch.from_numpy(rot_all).float().to(device)
+    # FG attribute parameters — optimised in Phase 2, detached in Phase 1
+    fg_color_param    = nn.Parameter(
+        torch.from_numpy(np.clip(f_dc_fg * C0 + 0.5, 0.0, 1.0)).float().to(device)
+    )  # (N_fg, 3) pre-activated RGB
+    fg_opacity_param  = nn.Parameter(
+        torch.from_numpy(op_fg).float().to(device)
+    )  # (N_fg,) pre-sigmoid logits
+    fg_logscale_param = nn.Parameter(
+        torch.from_numpy(log_sc_fg).float().to(device)
+    )  # (N_fg, 3) log-scales; composed with s_refined at render time
+    fg_rot_param      = nn.Parameter(
+        torch.from_numpy(rot_fg).float().to(device)
+    )  # (N_fg, 4) raw quaternions; rasterizer normalises internally
 
-    # Bg scales fixed; fg scales base (without placement scale, applied per step)
-    scales_bg_t      = torch.from_numpy(np.exp(log_sc_bg)).float().to(device)   # (N_bg, 3)
-    scales_fg_base_t = torch.from_numpy(np.exp(log_sc_fg)).float().to(device)   # (N_fg, 3)
+    # Anchor copies for L2 regularisation (detached, fixed throughout)
+    fg_color_anchor    = fg_color_param.data.clone()
+    fg_opacity_anchor  = fg_opacity_param.data.clone()
+    fg_logscale_anchor = fg_logscale_param.data.clone()
+    fg_rot_anchor      = fg_rot_param.data.clone()
 
     # Fixed bg positions (no grad)
     xyz_bg_t   = torch.from_numpy(xyz_bg).float().to(device)
@@ -777,7 +798,7 @@ def main():
                 xyz_fg_t, R_base_t, t_base_t, s_base, delta_q0, delta_t0, delta_s0
             )
             means3D_init = torch.cat([xyz_bg_t, means3D_fg_init], dim=0)
-            scales_init  = torch.cat([scales_bg_t, scales_fg_base_t * s_base], dim=0)
+            scales_init  = torch.cat([scales_bg_t, torch.exp(fg_logscale_param.data) * s_base], dim=0)
 
         for cam_i in selected:
             pose_w2c_i, FoVx_i, FoVy_i, W_i, H_i = all_cams[cam_i]
@@ -787,8 +808,11 @@ def main():
 
             # Render full composite at initial placement to get fg alpha mask
             with torch.no_grad():
+                colors_init_t = torch.cat([colors_bg_t, fg_color_param.data.clamp(0, 1)], dim=0)
+                alpha_init_t  = torch.cat([alpha_bg_t, torch.sigmoid(fg_opacity_param.data).unsqueeze(1)], dim=0)
+                rot_init_t    = torch.cat([rot_bg_t, fg_rot_param.data], dim=0)
                 color_i, depth_i, alpha_i = render_diff(
-                    means3D_init, colors_t, alpha_t, scales_init, rot_t,
+                    means3D_init, colors_init_t, alpha_init_t, scales_init, rot_init_t,
                     viewmat_i, fullproj_i, campos_i, tfovx_i, tfovy_i,
                     W_f, H_f, device,
                 )
@@ -847,7 +871,7 @@ def main():
             print("\n--- Pre-computing background depth at source camera ---")
             with torch.no_grad():
                 _, bg_depth_raw, _ = render_diff(
-                    xyz_bg_t, colors_t[:N_bg], alpha_t[:N_bg], scales_bg_t, rot_t[:N_bg],
+                    xyz_bg_t, colors_bg_t, alpha_bg_t, scales_bg_t, rot_bg_t,
                     src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
                     rW, rH, device,
                 )
@@ -875,10 +899,6 @@ def main():
         {"params": [delta_s], "lr": lr_s},
     ])
 
-    best_total = float("inf")
-    best_state = {"delta_q": delta_q.data.clone(),
-                  "delta_t": delta_t.data.clone(),
-                  "delta_s": delta_s.data.clone()}
 
     # -----------------------------------------------------------------------
     # Optimisation loop
@@ -886,16 +906,40 @@ def main():
     print(f"\n--- Optimising {args.n_steps} steps ---")
     pbar = tqdm(range(args.n_steps), desc="optimising")
     for step in pbar:
+        # Phase transition: unlock fg attribute optimisation at phase1_steps
+        if step == args.phase1_steps and args.phase1_steps < args.n_steps:
+            print(f"\n--- Phase 2: unlocking fg attribute optimisation (attr_lr={args.attr_lr}) ---")
+            optimizer.add_param_group({"params": [fg_color_param],    "lr": args.attr_lr})
+            optimizer.add_param_group({"params": [fg_opacity_param],  "lr": args.attr_lr})
+            optimizer.add_param_group({"params": [fg_logscale_param], "lr": args.attr_lr})
+            optimizer.add_param_group({"params": [fg_rot_param],      "lr": args.attr_lr})
+
         optimizer.zero_grad()
 
-        # Compute refined fg positions and scales (both depend on delta_s)
+        # Compute rigid transform (always active)
         means3D_fg = apply_rigid(
             xyz_fg_t, R_base_t, t_base_t, s_base, delta_q, delta_t, delta_s
         )
-        means3D    = torch.cat([xyz_bg_t, means3D_fg], dim=0)
-        # Fg Gaussian extents also scale with s_refined (same factor as positions)
-        s_refined  = s_base * torch.exp(delta_s.squeeze())
-        scales_t   = torch.cat([scales_bg_t, scales_fg_base_t * s_refined], dim=0)
+        means3D   = torch.cat([xyz_bg_t, means3D_fg], dim=0)
+        s_refined = s_base * torch.exp(delta_s.squeeze())
+
+        # Assemble combined attribute tensors each step.
+        # Phase 1: fg attributes detached (rigid only). Phase 2: fg attributes have grad.
+        if step < args.phase1_steps:
+            colors_fg = fg_color_param.detach().clamp(0.0, 1.0)
+            alpha_fg  = torch.sigmoid(fg_opacity_param.detach()).unsqueeze(1)
+            rot_fg_t  = fg_rot_param.detach()
+            scales_fg = torch.exp(fg_logscale_param.detach()) * s_refined
+        else:
+            colors_fg = fg_color_param.clamp(0.0, 1.0)
+            alpha_fg  = torch.sigmoid(fg_opacity_param).unsqueeze(1)
+            rot_fg_t  = fg_rot_param
+            scales_fg = torch.exp(fg_logscale_param) * s_refined
+
+        colors_t = torch.cat([colors_bg_t, colors_fg], dim=0)  # (N_total, 3)
+        alpha_t  = torch.cat([alpha_bg_t,  alpha_fg],  dim=0)  # (N_total, 1)
+        rot_t    = torch.cat([rot_bg_t,    rot_fg_t],  dim=0)  # (N_total, 4)
+        scales_t = torch.cat([scales_bg_t, scales_fg], dim=0)  # (N_total, 3)
 
         # ---- Render from source camera ----
         color_src, depth_src, alpha_src = render_diff(
@@ -985,18 +1029,20 @@ def main():
             flux_loss = ((color_f.clamp(0, 1) - target_f) ** 2).mean()
             total_loss = total_loss + args.flux_weight * flux_loss
 
+        # ---- Anchor regularisation (Phase 2: keep attributes near initial values) ----
+        anchor_loss = torch.tensor(0.0, device=device)
+        if step >= args.phase1_steps and args.anchor_weight > 0:
+            anchor_loss = (
+                  ((fg_color_param    - fg_color_anchor)    ** 2).mean()
+                + ((fg_opacity_param  - fg_opacity_anchor)  ** 2).mean()
+                + ((fg_logscale_param - fg_logscale_anchor) ** 2).mean()
+                + ((fg_rot_param      - fg_rot_anchor)      ** 2).mean()
+            )
+            total_loss = total_loss + args.anchor_weight * anchor_loss
+
         # ---- Backprop + step ----
         total_loss.backward()
         optimizer.step()
-
-        # Track best
-        if total_loss.item() < best_total:
-            best_total = total_loss.item()
-            best_state = {
-                "delta_q": delta_q.data.clone(),
-                "delta_t": delta_t.data.clone(),
-                "delta_s": delta_s.data.clone(),
-            }
 
         dq_dev = (delta_q.data / delta_q.data.norm() - delta_q.data.new_tensor([1., 0., 0., 0.])).norm()
         pbar.set_postfix(
@@ -1005,6 +1051,7 @@ def main():
             sil=f"{sil_loss.item():.4f}",
             depth=f"{depth_loss.item():.4f}",
             flux=f"{flux_loss.item():.4f}",
+            anchor=f"{anchor_loss.item():.4f}",
             dq=f"{dq_dev.item():.4f}",
         )
 
@@ -1056,11 +1103,11 @@ def main():
     # -----------------------------------------------------------------------
     print("\n--- Computing refined placement ---")
     with torch.no_grad():
-        R_delta = quat_to_matrix(best_state["delta_q"])
+        R_delta = quat_to_matrix(delta_q)
         R_refined = (R_delta @ R_base_t).float().cpu().numpy().tolist()
-        t_refined = (t_base_t + best_state["delta_t"]).float().cpu().numpy().tolist()
-        s_refined = float(s_base * torch.exp(best_state["delta_s"].squeeze()).item())
-        dq_norm = best_state["delta_q"] / best_state["delta_q"].norm()
+        t_refined = (t_base_t + delta_t).float().cpu().numpy().tolist()
+        s_refined = float(s_base * torch.exp(delta_s.squeeze()).item())
+        dq_norm = delta_q / delta_q.norm()
         dq_dev  = (dq_norm - dq_norm.new_tensor([1., 0., 0., 0.])).norm().item()
 
     print(f"  s_refined:  {s_refined:.4f}  (base {s_base:.4f})")
@@ -1092,15 +1139,19 @@ def main():
     # -----------------------------------------------------------------------
     print("\n--- Saving debug render ---")
     with torch.no_grad():
-        dq = best_state["delta_q"].to(device)
-        dt = best_state["delta_t"].to(device)
-        ds = best_state["delta_s"].to(device)
-        means3D_fg_ref = apply_rigid(xyz_fg_t, R_base_t, t_base_t, s_base, dq, dt, ds)
+        means3D_fg_ref = apply_rigid(xyz_fg_t, R_base_t, t_base_t, s_base, delta_q, delta_t, delta_s)
         means3D_ref    = torch.cat([xyz_bg_t, means3D_fg_ref], dim=0)
-        s_ref          = s_base * torch.exp(ds.squeeze())
-        scales_ref     = torch.cat([scales_bg_t, scales_fg_base_t * s_ref], dim=0)
+        s_ref          = s_base * torch.exp(delta_s.squeeze())
+        final_colors_fg = fg_color_param.clamp(0.0, 1.0)
+        final_alpha_fg  = torch.sigmoid(fg_opacity_param).unsqueeze(1)
+        final_rot_fg    = fg_rot_param
+        final_scales_fg = torch.exp(fg_logscale_param) * s_ref
+        colors_ref = torch.cat([colors_bg_t, final_colors_fg], dim=0)
+        alpha_ref  = torch.cat([alpha_bg_t,  final_alpha_fg],  dim=0)
+        rot_ref    = torch.cat([rot_bg_t,    final_rot_fg],    dim=0)
+        scales_ref = torch.cat([scales_bg_t, final_scales_fg], dim=0)
         color_ref, _, _ = render_diff(
-            means3D_ref, colors_t, alpha_t, scales_ref, rot_t,
+            means3D_ref, colors_ref, alpha_ref, scales_ref, rot_ref,
             src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
             rW, rH, device,
         )
