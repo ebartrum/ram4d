@@ -1068,13 +1068,20 @@ def main():
                     rW, rH, device,
                 )
                 sil_np = (sil_render_v.mean(0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                # Foreground-only render (black background)
+                fg_only_v, _, _ = render_diff(
+                    means3D_fg, colors_fg, alpha_fg, scales_fg, rot_fg_t,
+                    src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
+                    rW, rH, device,
+                )
+                fg_only_np = (fg_only_v.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             sil_rendered = np.stack([sil_np] * 3, axis=-1)
             if mask_src_t is not None:
                 gt_sil = (mask_src_t.cpu().numpy() > 0.5).astype(np.uint8) * 255
                 gt_sil_rgb = np.stack([gt_sil] * 3, axis=-1)
             else:
                 gt_sil_rgb = np.zeros_like(sil_rendered)
-            panels = [rendered_np, ref_img_r, sil_rendered, gt_sil_rgb]
+            panels = [rendered_np, ref_img_r, sil_rendered, gt_sil_rgb, fg_only_np]
             val_img = np.concatenate(panels, axis=1)
             imageio.imwrite(os.path.join(val_dir, f"val_{step:04d}.png"), val_img)
 
