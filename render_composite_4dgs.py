@@ -86,6 +86,12 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--static", action="store_true",
                         help="Freeze fg at frame 0 (static placement check, no animation)")
+    parser.add_argument("--fg_positions_path", default=None,
+                        help="Override path to fg_positions_world.npy "
+                             "(e.g. use fg_positions_world_deformed.npy from refine_deform.py)")
+    parser.add_argument("--placement_path", default=None,
+                        help="Override path to placement.json for fg scale "
+                             "(e.g. placement_refined.json from refine_frame0.py)")
     return parser.parse_args()
 
 
@@ -276,9 +282,9 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     gaussians_dir     = os.path.join(args.output_path, "gaussians")
-    fg_positions_path = os.path.join(gaussians_dir, "fg_positions_world.npy")
+    fg_positions_path = args.fg_positions_path or os.path.join(gaussians_dir, "fg_positions_world.npy")
     fg_ply_path       = os.path.join(gaussians_dir, "gaussians.ply")
-    placement_path    = os.path.join(gaussians_dir, "placement.json")
+    placement_path    = args.placement_path or os.path.join(gaussians_dir, "placement.json")
 
     if args.orbit:
         out_video  = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames.mp4")

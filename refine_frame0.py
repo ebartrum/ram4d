@@ -579,6 +579,8 @@ def parse_args():
     parser.add_argument("--silhouette_weight", type=float, default=1.0)
     parser.add_argument("--depth_weight",      type=float, default=0.0,
                         help="Marigold SDS depth loss weight (default 0, loads Marigold if > 0)")
+    parser.add_argument("--occlusion_weight",  type=float, default=50.0,
+                        help="Weight for fg-behind-bg depth ordering penalty (default 50)")
     parser.add_argument("--sds_t_min", type=int, default=50,
                         help="Min noise timestep for SDS (default 50)")
     parser.add_argument("--sds_t_max", type=int, default=500,
@@ -884,6 +886,28 @@ def main():
             )
 
     # -----------------------------------------------------------------------
+    # Background depth map — pre-rendered for occlusion loss (Option B)
+    # -----------------------------------------------------------------------
+    bg_depth_color_map = None
+    bg_occlusion_mask  = None
+
+    if args.occlusion_weight > 0:
+        print("\n--- Pre-rendering background depth map (occlusion loss) ---")
+        with torch.no_grad():
+            bg_hom      = torch.cat([xyz_bg_t, torch.ones(N_bg, 1, device=device)], dim=1)
+            bg_z        = (bg_hom @ src_viewmat)[:, 2]               # (N_bg,)
+            bg_z_colors = bg_z.unsqueeze(1).expand(-1, 3).float()    # (N_bg, 3)
+            bg_depth_render, _, _ = render_diff(
+                xyz_bg_t, bg_z_colors, alpha_bg_t, scales_bg_t, rot_bg_t,
+                src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
+                rW, rH, device,
+            )
+        bg_depth_color_map = bg_depth_render[0].detach()       # (H, W), no grad
+        bg_occlusion_mask  = (bg_depth_color_map > 0).float()  # (H, W)
+        print(f"  BG depth: shape={bg_depth_color_map.shape}, "
+              f"non-zero={bg_occlusion_mask.sum().int().item()} px")
+
+    # -----------------------------------------------------------------------
     # Rigid parameters + optimiser
     # -----------------------------------------------------------------------
     print("\n--- Initialising optimisation ---")
@@ -1011,6 +1035,23 @@ def main():
                 )
             total_loss = total_loss + args.depth_weight * depth_loss
 
+        # ---- Occlusion loss: penalise fg Gaussians rendered behind bg ----
+        occlusion_loss = torch.tensor(0.0, device=device)
+        if args.occlusion_weight > 0 and bg_depth_color_map is not None:
+            fg_hom      = torch.cat([means3D_fg, torch.ones(N_fg, 1, device=device)], dim=1)
+            fg_z        = (fg_hom @ src_viewmat)[:, 2]               # (N_fg,)
+            fg_z_colors = fg_z.unsqueeze(1).expand(-1, 3).float()    # (N_fg, 3)
+            fg_depth_render, _, _ = render_diff(
+                means3D_fg, fg_z_colors, alpha_fg, scales_fg, rot_fg_t,
+                src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
+                rW, rH, device,
+            )
+            fg_depth_map   = fg_depth_render[0]  # (H, W), has grad via means3D_fg
+            occlusion_loss = (
+                F.relu(fg_depth_map - bg_depth_color_map) ** 2 * bg_occlusion_mask
+            ).sum() / (bg_occlusion_mask.sum() + 1e-6)
+            total_loss = total_loss + args.occlusion_weight * occlusion_loss
+
         # ---- Flux pseudo-GT loss (cycle through training cameras) ----
         flux_loss = torch.tensor(0.0, device=device)
         if args.flux_weight > 0 and flux_pseudogt_targets:
@@ -1050,6 +1091,7 @@ def main():
             photo=f"{rgb_loss.item():.4f}",
             sil=f"{sil_loss.item():.4f}",
             depth=f"{depth_loss.item():.4f}",
+            occl=f"{occlusion_loss.item():.4f}",
             flux=f"{flux_loss.item():.4f}",
             anchor=f"{anchor_loss.item():.4f}",
             dq=f"{dq_dev.item():.4f}",
