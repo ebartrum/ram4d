@@ -1113,8 +1113,8 @@ def main():
     print(f"  s_refined:  {s_refined:.4f}  (base {s_base:.4f})")
     print(f"  t_refined:  {[f'{x:.4f}' for x in t_refined]}")
     print(f"  |Δq - I|:   {dq_dev:.4f}")
-    print(f"  |Δt|:       {best_state['delta_t'].norm().item():.4f}")
-    print(f"  Δs:         {best_state['delta_s'].item():.4f}")
+    print(f"  |Δt|:       {delta_t.norm().item():.4f}")
+    print(f"  Δs:         {delta_s.item():.4f}")
 
     # -----------------------------------------------------------------------
     # Save placement_refined.json
