@@ -1158,6 +1158,16 @@ def main():
     debug_render = (color_ref.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     imageio.imwrite(os.path.join(debug_dir, "refined_render_src.png"), debug_render)
     imageio.imwrite(os.path.join(debug_dir, "reference_frame.png"), ref_img_r)
+
+    # Foreground-only render (black background)
+    with torch.no_grad():
+        color_fg_only, _, _ = render_diff(
+            means3D_fg_ref, final_colors_fg, final_alpha_fg, final_scales_fg, final_rot_fg,
+            src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
+            rW, rH, device,
+        )
+    fg_only_render = (color_fg_only.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    imageio.imwrite(os.path.join(debug_dir, "fg_only_render_src.png"), fg_only_render)
     print(f"  Debug renders: {debug_dir}/")
 
     print("\nDone. Next steps:")
