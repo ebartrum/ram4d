@@ -854,8 +854,9 @@ def main():
         with torch.no_grad():
             delta_xyz_np = deform_mlp(xyz_norm_t).float().cpu().numpy()  # (N_fg, 3)
 
-        # Apply the same frame-0 deformation to every frame (shape correction, not motion)
-        fg_pos_deformed = all_fg_pos_world + delta_xyz_np[None]  # (T, N_fg, 3)
+        # Anchor frame 0 to refined+deformed position; add animation motion on top.
+        motion_coarse = all_fg_pos_world - all_fg_pos_world[0:1]  # (T, N_fg, 3)
+        fg_pos_deformed = xyz_world_init_np[None] + motion_coarse + delta_xyz_np[None]
 
         deformed_path = os.path.join(gaussians_dir, "fg_positions_world_deformed.npy")
         np.save(deformed_path, fg_pos_deformed)
