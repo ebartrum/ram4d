@@ -94,6 +94,9 @@ def parse_args():
     parser.add_argument("--placement_path", default=None,
                         help="Override path to placement.json for fg scale "
                              "(e.g. placement_refined.json from refine_frame0.py)")
+    parser.add_argument("--render_output_dir", default=None,
+                        help="Directory to save rendered video and frame0 image "
+                             "(default: <output_path>/gaussians/)")
     return parser.parse_args()
 
 
@@ -288,15 +291,18 @@ def main():
     fg_ply_path       = os.path.join(gaussians_dir, "gaussians.ply")
     placement_path    = args.placement_path or os.path.join(gaussians_dir, "placement.json")
 
+    render_dir = args.render_output_dir or gaussians_dir
+    os.makedirs(render_dir, exist_ok=True)
+
     static_suffix  = "_static"  if args.static  else ""
     fg_only_suffix = "_fg_only" if args.fg_only else ""
     suffix = static_suffix + fg_only_suffix
     if args.orbit:
-        out_video  = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames{suffix}.mp4")
-        out_frame0 = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames{suffix}_frame0.png")
+        out_video  = os.path.join(render_dir, f"orbit_{args.n_frames}frames{suffix}.mp4")
+        out_frame0 = os.path.join(render_dir, f"orbit_{args.n_frames}frames{suffix}_frame0.png")
     else:
-        out_video  = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}{suffix}.mp4")
-        out_frame0 = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}{suffix}_frame0.png")
+        out_video  = os.path.join(render_dir, f"composite_cam{args.camera_idx}{suffix}.mp4")
+        out_frame0 = os.path.join(render_dir, f"composite_cam{args.camera_idx}{suffix}_frame0.png")
 
     # --- Foreground positions ---
     print("\n--- Loading fg_positions_world.npy ---")
