@@ -286,12 +286,13 @@ def main():
     fg_ply_path       = os.path.join(gaussians_dir, "gaussians.ply")
     placement_path    = args.placement_path or os.path.join(gaussians_dir, "placement.json")
 
+    static_suffix = "_static" if args.static else ""
     if args.orbit:
-        out_video  = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames.mp4")
-        out_frame0 = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames_frame0.png")
+        out_video  = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames{static_suffix}.mp4")
+        out_frame0 = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames{static_suffix}_frame0.png")
     else:
-        out_video  = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}.mp4")
-        out_frame0 = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}_frame0.png")
+        out_video  = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}{static_suffix}.mp4")
+        out_frame0 = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}{static_suffix}_frame0.png")
 
     # --- Foreground positions ---
     print("\n--- Loading fg_positions_world.npy ---")
