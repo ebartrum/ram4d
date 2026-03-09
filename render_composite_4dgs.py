@@ -86,6 +86,8 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--static", action="store_true",
                         help="Freeze fg at frame 0 (static placement check, no animation)")
+    parser.add_argument("--fg_only", action="store_true",
+                        help="Render foreground Gaussians only (no background 3DGS)")
     parser.add_argument("--fg_positions_path", default=None,
                         help="Override path to fg_positions_world.npy "
                              "(e.g. use fg_positions_world_deformed.npy from refine_deform.py)")
@@ -238,7 +240,7 @@ def make_raster_camera(pose_w2c, FoVx, FoVy, W, H, device, znear=0.01, zfar=200.
 # ---------------------------------------------------------------------------
 
 def render_frame(means3D, colors, opacities, scales, rotations,
-                 viewmatrix, full_proj, campos, tanfovx, tanfovy, W, H, device):
+                 viewmatrix, full_proj, campos, tanfovx, tanfovy, W, H, device, bg_color=None):
     N = means3D.shape[0]
     means2D = torch.zeros(N, 3, device=device, dtype=torch.float32)
 
@@ -247,7 +249,7 @@ def render_frame(means3D, colors, opacities, scales, rotations,
         image_width=W,
         tanfovx=float(tanfovx),
         tanfovy=float(tanfovy),
-        bg=torch.zeros(3, device=device, dtype=torch.float32),
+        bg=bg_color if bg_color is not None else torch.zeros(3, device=device, dtype=torch.float32),
         scale_modifier=1.0,
         viewmatrix=viewmatrix,
         projmatrix=full_proj,
@@ -286,13 +288,15 @@ def main():
     fg_ply_path       = os.path.join(gaussians_dir, "gaussians.ply")
     placement_path    = args.placement_path or os.path.join(gaussians_dir, "placement.json")
 
-    static_suffix = "_static" if args.static else ""
+    static_suffix  = "_static"  if args.static  else ""
+    fg_only_suffix = "_fg_only" if args.fg_only else ""
+    suffix = static_suffix + fg_only_suffix
     if args.orbit:
-        out_video  = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames{static_suffix}.mp4")
-        out_frame0 = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames{static_suffix}_frame0.png")
+        out_video  = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames{suffix}.mp4")
+        out_frame0 = os.path.join(gaussians_dir, f"orbit_{args.n_frames}frames{suffix}_frame0.png")
     else:
-        out_video  = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}{static_suffix}.mp4")
-        out_frame0 = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}{static_suffix}_frame0.png")
+        out_video  = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}{suffix}.mp4")
+        out_frame0 = os.path.join(gaussians_dir, f"composite_cam{args.camera_idx}{suffix}_frame0.png")
 
     # --- Foreground positions ---
     print("\n--- Loading fg_positions_world.npy ---")
@@ -323,26 +327,36 @@ def main():
     print(f"  Native {cam_W}×{cam_H} → render {W}×{H}  (scale={args.render_scale})")
 
     # --- Background GS ---
-    print("\n--- Loading background 3DGS ---")
-    bg_ply = find_latest_ply(args.gs_model_path)
-    print(f"  PLY: {bg_ply}")
-    xyz_bg, f_dc_bg, op_bg, log_sc_bg, rot_bg = load_ply_gs(bg_ply)
-    print(f"  {len(xyz_bg):,} Gaussians")
+    if args.fg_only:
+        print("\n--- Skipping background 3DGS (--fg_only) ---")
+        xyz_bg_t = None
+        f_dc_all   = f_dc_fg
+        op_all     = op_fg
+        rot_all    = rot_fg
+        scales_all = scales_fg
+    else:
+        print("\n--- Loading background 3DGS ---")
+        bg_ply = find_latest_ply(args.gs_model_path)
+        print(f"  PLY: {bg_ply}")
+        xyz_bg, f_dc_bg, op_bg, log_sc_bg, rot_bg = load_ply_gs(bg_ply)
+        print(f"  {len(xyz_bg):,} Gaussians")
+        xyz_bg_t   = torch.from_numpy(xyz_bg).float().to(device)
+        f_dc_all   = np.concatenate([f_dc_bg,  f_dc_fg ], axis=0)
+        op_all     = np.concatenate([op_bg,    op_fg   ], axis=0)
+        rot_all    = np.concatenate([rot_bg,   rot_fg  ], axis=0)
+        scales_all = np.concatenate([np.exp(log_sc_bg), scales_fg], axis=0)
 
     # --- Build GPU attribute tensors (shared across all frames) ---
     print("\n--- Building GPU tensors ---")
-    f_dc_all   = np.concatenate([f_dc_bg,  f_dc_fg ], axis=0)
-    op_all     = np.concatenate([op_bg,    op_fg   ], axis=0)
-    rot_all    = np.concatenate([rot_bg,   rot_fg  ], axis=0)
-    scales_all = np.concatenate([np.exp(log_sc_bg), scales_fg], axis=0)
-
     rgb_t    = torch.from_numpy(np.clip(f_dc_all * C0 + 0.5, 0.0, 1.0)).float().to(device)
     alpha_t  = torch.from_numpy(1.0 / (1.0 + np.exp(-op_all))).float().to(device).unsqueeze(1)
     scales_t = torch.from_numpy(scales_all).float().to(device)
     rot_t    = torch.from_numpy(rot_all).float().to(device)
-    xyz_bg_t = torch.from_numpy(xyz_bg).float().to(device)
 
-    print(f"  Total Gaussians: {len(f_dc_all):,}  (bg={len(xyz_bg):,}  fg={N_fg:,})")
+    if args.fg_only:
+        print(f"  Total Gaussians: {N_fg:,}  (fg only)")
+    else:
+        print(f"  Total Gaussians: {len(f_dc_all):,}  (bg={len(xyz_bg):,}  fg={N_fg:,})")
     print(f"  GPU memory: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB allocated")
 
     # --- In single-camera mode, render one frame per fg animation frame.
@@ -365,11 +379,12 @@ def main():
             pose_w2c, FoVx, FoVy, W, H, device
         )
         fg_pos_t = torch.from_numpy(fg_positions_world[t_fg]).float().to(device)
-        means3D  = torch.cat([xyz_bg_t, fg_pos_t], dim=0)
+        means3D  = fg_pos_t if args.fg_only else torch.cat([xyz_bg_t, fg_pos_t], dim=0)
 
+        bg_color = torch.ones(3, device=device, dtype=torch.float32) if args.fg_only else None
         img = render_frame(
             means3D, rgb_t, alpha_t, scales_t, rot_t,
-            viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
+            viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device, bg_color=bg_color,
         )
         frames.append(img)
 
