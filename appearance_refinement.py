@@ -1,11 +1,13 @@
 """
 appearance_refinement.py — Render inputs for Gaussian appearance refinement.
 
-Produces:
+Produces per camera:
   - <output_dir>/<prefix>_input_<camera_idx>.png   : composite RGB render (bg + fg)
   - <output_dir>/<prefix>_mask_<camera_idx>.png    : fg silhouette mask, dilated
+  - <output_dir>/<prefix>_refined_<camera_idx>.png : Flux-inpainted refinement
 
 Usage:
+  # Single camera:
   python appearance_refinement.py \\
       --output_path output/2026.03.03/actionmesh_gs_replace_corgi \\
       --gs_scene_path Inpaint360GS/data/inpaint360/bag \\
@@ -13,6 +15,15 @@ Usage:
       --placement_path output/2026.03.09/corgi_refined_consistent_occl/placement_refined.json \\
       --render_output_dir output/2026.03.09/corgi_appearance_refinement \\
       --camera_idx 20
+
+  # All training cameras:
+  python appearance_refinement.py \\
+      --output_path output/2026.03.03/actionmesh_gs_replace_corgi \\
+      --gs_scene_path Inpaint360GS/data/inpaint360/bag \\
+      --gs_model_path output/2026.02.26/inpainted_scene/point_cloud_object_inpaint_virtual \\
+      --placement_path output/2026.03.09/corgi_refined_consistent_occl/placement_refined.json \\
+      --render_output_dir output/2026.03.09/corgi_appearance_refinement \\
+      --all_cameras
 """
 
 import sys
@@ -66,6 +77,12 @@ def parse_args():
                         help="Override path to fg_positions_world.npy")
     parser.add_argument("--camera_idx", type=int, default=20,
                         help="COLMAP training camera index to render from (default: 20)")
+    parser.add_argument("--all_cameras", action="store_true",
+                        help="Process all training cameras (ignores --camera_idx)")
+    parser.add_argument("--skip_existing", action="store_true", default=True,
+                        help="Skip cameras whose refined output already exists (default: True)")
+    parser.add_argument("--no_skip_existing", dest="skip_existing", action="store_false",
+                        help="Re-process cameras even if output already exists")
     parser.add_argument("--render_output_dir", default=None,
                         help="Directory to save outputs (default: <output_path>/gaussians/)")
     parser.add_argument("--output_prefix", default="appearance_refinement",
@@ -77,8 +94,8 @@ def parse_args():
     # Flux refinement
     parser.add_argument("--prompt_path", required=True,
                         help="Path to prompt .txt file for Flux inpainting refinement")
-    parser.add_argument("--flux_strength", type=float, default=0.3,
-                        help="Flux inpainting strength (0=no change, 1=full redraw, default: 0.3)")
+    parser.add_argument("--flux_strength", type=float, default=0.1,
+                        help="Flux inpainting strength (0=no change, 1=full redraw, default: 0.1)")
     parser.add_argument("--flux_steps", type=int, default=28,
                         help="Flux number of inference steps (default: 28)")
     parser.add_argument("--flux_guidance", type=float, default=3.5,
@@ -225,33 +242,104 @@ def render_frame(means3D, colors, opacities, scales, rotations,
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def render_camera(camera_idx, args, device,
+                  fg_positions_world, rgb_fg, alpha_fg, scales_fg, rot_fg,
+                  rgb_all, alpha_all, scales_all, rot_all, xyz_bg,
+                  render_dir):
+    """Render input composite + fg mask for one camera. Returns (out_input, mask_pil, W, H)."""
+    out_input = os.path.join(render_dir, f"{args.output_prefix}_input_{camera_idx}.png")
+    out_mask  = os.path.join(render_dir, f"{args.output_prefix}_mask_{camera_idx}.png")
 
-    gaussians_dir    = os.path.join(args.output_path, "gaussians")
-    fg_positions_path = args.fg_positions_path or os.path.join(gaussians_dir, "fg_positions_world.npy")
-    fg_ply_path      = os.path.join(gaussians_dir, "gaussians.ply")
-    placement_path   = args.placement_path or os.path.join(gaussians_dir, "placement.json")
-
-    render_dir = args.render_output_dir or gaussians_dir
-    os.makedirs(render_dir, exist_ok=True)
-
-    out_input = os.path.join(render_dir, f"{args.output_prefix}_input_{args.camera_idx}.png")
-    out_mask  = os.path.join(render_dir, f"{args.output_prefix}_mask_{args.camera_idx}.png")
-
-    # --- Camera ---
-    print("\n--- Loading camera ---")
-    pose_w2c, FoVx, FoVy, cam_W, cam_H = load_colmap_camera(args.gs_scene_path, args.camera_idx)
+    pose_w2c, FoVx, FoVy, cam_W, cam_H = load_colmap_camera(args.gs_scene_path, camera_idx)
     W = max(1, int(cam_W * args.render_scale))
     H = max(1, int(cam_H * args.render_scale))
-    print(f"  Native {cam_W}×{cam_H} → render {W}×{H}  (scale={args.render_scale})")
 
     viewmat, full_proj, campos, tanfovx, tanfovy = make_raster_camera(
         pose_w2c, FoVx, FoVy, W, H, device
     )
 
-    # --- Foreground ---
+    fg_pos_t = torch.from_numpy(fg_positions_world[0]).float().to(device)
+    means3D_all = torch.cat([xyz_bg, fg_pos_t], dim=0)
+
+    img = render_frame(
+        means3D_all, rgb_all, alpha_all, scales_all, rot_all,
+        viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
+    )
+    Image.fromarray((img * 255).astype(np.uint8)).save(out_input)
+
+    white_fg = torch.ones_like(rgb_fg)
+    mask_img = render_frame(
+        fg_pos_t, white_fg, alpha_fg, scales_fg, rot_fg,
+        viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
+        bg_color=torch.zeros(3, device=device, dtype=torch.float32),
+    )
+    mask_bin = mask_img.mean(axis=2) > 0.5
+    if args.mask_dilation > 0:
+        struct = np.ones((args.mask_dilation * 2 + 1, args.mask_dilation * 2 + 1), dtype=bool)
+        mask_bin = binary_dilation(mask_bin, structure=struct)
+    mask_pil = Image.fromarray((mask_bin * 255).astype(np.uint8), mode="L")
+    mask_pil.save(out_mask)
+
+    return out_input, mask_pil, W, H
+
+
+def run_flux(pipe, prompt, out_input, mask_pil, W, H, args, camera_idx, render_dir):
+    """Run Flux inpainting on one camera's input. Saves and returns output path."""
+    out_refined = os.path.join(render_dir, f"{args.output_prefix}_refined_{camera_idx}.png")
+
+    input_pil = Image.open(out_input).convert("RGB")
+
+    # Flux requires dimensions divisible by 16
+    W_flux = (input_pil.width  // 16) * 16
+    H_flux = (input_pil.height // 16) * 16
+    if W_flux != input_pil.width or H_flux != input_pil.height:
+        input_pil = input_pil.resize((W_flux, H_flux), Image.LANCZOS)
+        mask_pil  = mask_pil.resize((W_flux, H_flux), Image.NEAREST)
+
+    result = pipe(
+        prompt=prompt,
+        image=input_pil,
+        mask_image=mask_pil,
+        width=W_flux,
+        height=H_flux,
+        strength=args.flux_strength,
+        num_inference_steps=args.flux_steps,
+        guidance_scale=args.flux_guidance,
+        max_sequence_length=512,
+        generator=torch.Generator("cpu").manual_seed(args.seed),
+    ).images[0]
+
+    if result.width != W or result.height != H:
+        result = result.resize((W, H), Image.LANCZOS)
+
+    result.save(out_refined)
+    return out_refined
+
+
+def main():
+    args = parse_args()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    gaussians_dir     = os.path.join(args.output_path, "gaussians")
+    fg_positions_path = args.fg_positions_path or os.path.join(gaussians_dir, "fg_positions_world.npy")
+    fg_ply_path       = os.path.join(gaussians_dir, "gaussians.ply")
+    placement_path    = args.placement_path or os.path.join(gaussians_dir, "placement.json")
+
+    render_dir = args.render_output_dir or gaussians_dir
+    os.makedirs(render_dir, exist_ok=True)
+
+    # Determine camera indices to process
+    if args.all_cameras:
+        from scene.colmap_loader import read_extrinsics_binary
+        exts = read_extrinsics_binary(
+            os.path.join(args.gs_scene_path, "sparse", "0", "images.bin")
+        )
+        camera_indices = list(range(len(exts)))
+        print(f"\nProcessing all {len(camera_indices)} training cameras")
+    else:
+        camera_indices = [args.camera_idx]
+
+    # --- Load Gaussian data (shared across all cameras) ---
     print("\n--- Loading foreground Gaussians ---")
     fg_positions_world = np.load(fg_positions_path)   # (T, N_fg, 3)
     _, f_dc_fg, op_fg, log_sc_fg, rot_fg = load_ply_gs(fg_ply_path)
@@ -261,13 +349,11 @@ def main():
     N_fg = fg_positions_world.shape[1]
     print(f"  {N_fg:,} Gaussians  scale={scale:.4f}")
 
-    fg_pos_t  = torch.from_numpy(fg_positions_world[0]).float().to(device)
-    rgb_fg_t  = torch.from_numpy(np.clip(f_dc_fg * C0 + 0.5, 0.0, 1.0)).float().to(device)
-    alpha_fg_t = torch.from_numpy(1.0 / (1.0 + np.exp(-op_fg))).float().to(device).unsqueeze(1)
+    rgb_fg_t    = torch.from_numpy(np.clip(f_dc_fg * C0 + 0.5, 0.0, 1.0)).float().to(device)
+    alpha_fg_t  = torch.from_numpy(1.0 / (1.0 + np.exp(-op_fg))).float().to(device).unsqueeze(1)
     scales_fg_t = torch.from_numpy(scales_fg).float().to(device)
-    rot_fg_t  = torch.from_numpy(rot_fg).float().to(device)
+    rot_fg_t    = torch.from_numpy(rot_fg).float().to(device)
 
-    # --- Background ---
     print("\n--- Loading background 3DGS ---")
     bg_ply = find_latest_ply(args.gs_model_path)
     print(f"  PLY: {bg_ply}")
@@ -284,88 +370,52 @@ def main():
     scales_all_t = torch.from_numpy(scales_all).float().to(device)
     rot_all_t    = torch.from_numpy(rot_all).float().to(device)
     xyz_bg_t     = torch.from_numpy(xyz_bg).float().to(device)
-    means3D_all  = torch.cat([xyz_bg_t, fg_pos_t], dim=0)
 
-    print(f"  Total: {means3D_all.shape[0]:,}  (bg={len(xyz_bg):,}  fg={N_fg:,})")
+    # --- Phase 1: Render all cameras ---
+    print(f"\n--- Rendering {len(camera_indices)} cameras ---")
+    mask_pils = {}   # camera_idx -> (mask_pil, W, H, out_input)
+    for i, cam_idx in enumerate(camera_indices):
+        out_refined = os.path.join(render_dir, f"{args.output_prefix}_refined_{cam_idx}.png")
+        if args.skip_existing and os.path.exists(out_refined):
+            print(f"  [{i+1}/{len(camera_indices)}] cam {cam_idx}: skip (exists)")
+            continue
+        print(f"  [{i+1}/{len(camera_indices)}] cam {cam_idx}: rendering...", end=" ", flush=True)
+        out_input, mask_pil, W, H = render_camera(
+            cam_idx, args, device,
+            fg_positions_world, rgb_fg_t, alpha_fg_t, scales_fg_t, rot_fg_t,
+            rgb_all_t, alpha_all_t, scales_all_t, rot_all_t, xyz_bg_t,
+            render_dir,
+        )
+        mask_pils[cam_idx] = (mask_pil, W, H, out_input)
+        print("done")
 
-    # --- Render composite RGB ---
-    print(f"\n--- Rendering composite RGB → {out_input} ---")
-    img = render_frame(
-        means3D_all, rgb_all_t, alpha_all_t, scales_all_t, rot_all_t,
-        viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
-    )
-    Image.fromarray((img * 255).astype(np.uint8)).save(out_input)
-    print(f"  Saved: {out_input}")
+    if not mask_pils:
+        print("\nAll outputs already exist — nothing to do.")
+        return
 
-    # --- Render fg silhouette mask ---
-    print(f"\n--- Rendering fg mask → {out_mask} ---")
-    white = torch.ones(3, device=device, dtype=torch.float32)
-    white_fg_t = torch.ones_like(rgb_fg_t)
-    mask_img = render_frame(
-        fg_pos_t, white_fg_t, alpha_fg_t, scales_fg_t, rot_fg_t,
-        viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
-        bg_color=torch.zeros(3, device=device, dtype=torch.float32),
-    )
-    # Binarise (threshold at 0.5) then dilate
-    mask_bin = mask_img.mean(axis=2) > 0.5
-    if args.mask_dilation > 0:
-        struct = np.ones((args.mask_dilation * 2 + 1, args.mask_dilation * 2 + 1), dtype=bool)
-        mask_bin = binary_dilation(mask_bin, structure=struct)
-    mask_out = (mask_bin * 255).astype(np.uint8)
-    mask_pil = Image.fromarray(mask_out, mode="L")
-    mask_pil.save(out_mask)
-    print(f"  Saved: {out_mask}  (dilation={args.mask_dilation}px)")
+    # --- Free GS GPU memory before loading Flux ---
+    del rgb_all_t, alpha_all_t, scales_all_t, rot_all_t
+    del rgb_fg_t, alpha_fg_t, scales_fg_t, rot_fg_t
+    del xyz_bg_t
+    torch.cuda.empty_cache()
 
-    # --- Flux inpainting refinement ---
+    # --- Phase 2: Flux inpainting for all rendered cameras ---
     from diffusers import FluxInpaintPipeline
 
     with open(args.prompt_path) as f:
         prompt = f.read().strip()
-    print(f"\n--- Flux inpainting refinement (strength={args.flux_strength}) ---")
+    print(f"\n--- Flux inpainting (strength={args.flux_strength}, {len(mask_pils)} cameras) ---")
     print(f"  Prompt: {prompt}")
-
-    out_refined = os.path.join(render_dir, f"{args.output_prefix}_refined_{args.camera_idx}.png")
-
-    # Free GS GPU memory before loading Flux
-    del means3D_all, rgb_all_t, alpha_all_t, scales_all_t, rot_all_t
-    del fg_pos_t, rgb_fg_t, alpha_fg_t, scales_fg_t, rot_fg_t
-    del xyz_bg_t
-    torch.cuda.empty_cache()
-
-    input_pil = Image.open(out_input).convert("RGB")
-
-    # Flux requires dimensions divisible by 16
-    W_flux = (input_pil.width  // 16) * 16
-    H_flux = (input_pil.height // 16) * 16
-    if W_flux != input_pil.width or H_flux != input_pil.height:
-        print(f"  Resizing {input_pil.width}×{input_pil.height} → {W_flux}×{H_flux} for Flux")
-        input_pil = input_pil.resize((W_flux, H_flux), Image.LANCZOS)
-        mask_pil  = mask_pil.resize((W_flux, H_flux), Image.NEAREST)
 
     pipe = FluxInpaintPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16
     )
     pipe.enable_model_cpu_offload()
 
-    result = pipe(
-        prompt=prompt,
-        image=input_pil,
-        mask_image=mask_pil,
-        width=W_flux,
-        height=H_flux,
-        strength=args.flux_strength,
-        num_inference_steps=args.flux_steps,
-        guidance_scale=args.flux_guidance,
-        max_sequence_length=512,
-        generator=torch.Generator("cpu").manual_seed(args.seed),
-    ).images[0]
-
-    # Resize back to original render resolution if needed
-    if result.width != W or result.height != H:
-        result = result.resize((W, H), Image.LANCZOS)
-
-    result.save(out_refined)
-    print(f"  Saved: {out_refined}")
+    for i, (cam_idx, (mask_pil, W, H, out_input)) in enumerate(mask_pils.items()):
+        print(f"  [{i+1}/{len(mask_pils)}] cam {cam_idx}...", end=" ", flush=True)
+        out_refined = run_flux(pipe, prompt, out_input, mask_pil, W, H, args, cam_idx, render_dir)
+        print(f"saved → {os.path.basename(out_refined)}")
 
 
 if __name__ == "__main__":
