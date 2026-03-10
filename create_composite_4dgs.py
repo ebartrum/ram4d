@@ -197,6 +197,11 @@ def main():
         world_up, cam_center = load_colmap_cameras(args.gs_scene_path, args.camera_idx)
         print("\n--- Computing foreground orientation ---")
         R_fg = compute_fg_rotation(translation, cam_center, world_up, args.yaw_deg)
+        # Write R_fg back into placement.json so downstream scripts (refine_deform.py) can read it
+        placement["rotation"] = R_fg.tolist()
+        with open(placement_path, "w") as f:
+            json.dump(placement, f, indent=2)
+        print(f"  Saved rotation to {placement_path}")
 
     # --- Foreground 4DGS ---
     print("\n--- Loading foreground 4DGS ---")

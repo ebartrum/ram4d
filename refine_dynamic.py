@@ -80,6 +80,9 @@ from PIL import Image
 import imageio
 from tqdm import tqdm
 from plyfile import PlyData
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -359,7 +362,11 @@ def parse_args():
     # Optimisation
     parser.add_argument("--n_steps",       type=int,   default=2000)
     parser.add_argument("--lr",            type=float, default=1e-3,
-                        help="Adam learning rate (default 1e-3)")
+                        help="Base Adam learning rate — used if --lr_t / --lr_rot not set (default 1e-3)")
+    parser.add_argument("--lr_t",          type=float, default=None,
+                        help="Learning rate for delta_t (default: 10× --lr)")
+    parser.add_argument("--lr_rot",        type=float, default=None,
+                        help="Learning rate for delta_q (default: --lr)")
     parser.add_argument("--render_scale",  type=float, default=0.5,
                         help="Render scale relative to WAN frame resolution (default 0.5)")
     # Loss weights
@@ -371,8 +378,8 @@ def parse_args():
                         help="Occlusion depth penalty weight (default 50.0)")
     parser.add_argument("--depth_weight",      type=float, default=0.0,
                         help="Marigold pseudo-SDS depth loss weight (default 0, expensive)")
-    parser.add_argument("--temporal_weight",   type=float, default=1.0,
-                        help="Temporal velocity smoothness weight (default 1.0)")
+    parser.add_argument("--temporal_weight",   type=float, default=10.0,
+                        help="Temporal velocity smoothness weight (default 10.0)")
     parser.add_argument("--anchor_weight",     type=float, default=100.0,
                         help="Frame-0 anchor weight (default 100.0)")
     # Marigold settings
@@ -382,6 +389,10 @@ def parse_args():
     # Validation
     parser.add_argument("--val_interval", type=int, default=100,
                         help="Save val images every N steps (default 100)")
+    parser.add_argument("--target_frame", type=int, default=None,
+                        help="Single-frame diagnostic mode: only optimise this frame. "
+                             "Frame 0 is shown in val but kept fixed. "
+                             "Temporal and anchor losses are disabled.")
     return parser.parse_args()
 
 
@@ -579,9 +590,14 @@ def main():
     delta_q_init[:, 0] = 1.0               # identity quaternion [w=1, x=0, y=0, z=0]
     delta_q      = delta_q_init.requires_grad_(True)
 
-    optimizer = torch.optim.Adam([delta_t, delta_q], lr=args.lr)
+    lr_t   = args.lr_t   if args.lr_t   is not None else args.lr * 10
+    lr_rot = args.lr_rot if args.lr_rot is not None else args.lr
+    optimizer = torch.optim.Adam([
+        {"params": [delta_t], "lr": lr_t},
+        {"params": [delta_q], "lr": lr_rot},
+    ])
     print(f"  Parameters: delta_t {tuple(delta_t.shape)}, delta_q {tuple(delta_q.shape)}")
-    print(f"  Optimiser: Adam  lr={args.lr}")
+    print(f"  Optimiser: Adam  lr_t={lr_t}  lr_rot={lr_rot}")
 
     # -----------------------------------------------------------------------
     # Precompute for temporal consistency (fixed, no grad)
@@ -594,20 +610,26 @@ def main():
     # -----------------------------------------------------------------------
     # Fixed validation frames
     # -----------------------------------------------------------------------
-    val_frames = sorted(set([0, 20, 40, 60, 80, T - 1]))
+    if args.target_frame is not None:
+        val_frames = sorted(set([0, args.target_frame]))
+        print(f"\n--- Single-frame diagnostic mode: target_frame={args.target_frame} ---")
+        print(f"  Temporal and anchor losses disabled. Val frames: {val_frames}")
+    else:
+        val_frames = sorted(set([0, 20, 40, 60, 80, T - 1]))
     val_frames = [f for f in val_frames if f < T]
 
     # -----------------------------------------------------------------------
     # Optimisation loop
     # -----------------------------------------------------------------------
     print(f"\n--- Optimising {args.n_steps} steps ---")
+    loss_history = {"total": [], "rgb": [], "sil": [], "occl": [], "temp": [], "anch": []}
     pbar = tqdm(range(args.n_steps), desc="optimising")
 
     for step in pbar:
         optimizer.zero_grad()
 
-        # Sample a random frame
-        t_idx = random.randint(0, T - 1)
+        # Sample a frame (fixed in single-frame diagnostic mode)
+        t_idx = args.target_frame if args.target_frame is not None else random.randint(0, T - 1)
 
         # Apply per-frame rigid correction to deformed positions
         new_pos = apply_rigid_frame(
@@ -694,7 +716,7 @@ def main():
         # Operates on ALL frames each step (no rendering required).
         # Penalises jerky motion in the final trajectory (coarse + delta).
         temporal_loss = torch.tensor(0.0, device=device)
-        if args.temporal_weight > 0 and T > 1:
+        if args.target_frame is None and args.temporal_weight > 0 and T > 1:
             q_norm    = delta_q / (delta_q.norm(dim=1, keepdim=True) + 1e-8)   # (T, 4)
             R_batch   = quat_to_matrix_batch(q_norm)                           # (T, 3, 3)
             # centered: (T, K, 3) — no grad (deformed positions minus per-frame centroid)
@@ -711,7 +733,7 @@ def main():
 
         # ---- Frame-0 anchor: keep frame 0 near zero corrections ----
         anchor_loss = torch.tensor(0.0, device=device)
-        if args.anchor_weight > 0:
+        if args.target_frame is None and args.anchor_weight > 0:
             e0          = torch.tensor([1., 0., 0., 0.], device=device)
             q0_norm     = delta_q[0] / (delta_q[0].norm() + 1e-8)
             anchor_loss = (delta_t[0] ** 2).sum() + (q0_norm - e0).pow(2).sum()
@@ -720,6 +742,13 @@ def main():
         # ---- Backprop + step ----
         total_loss.backward()
         optimizer.step()
+
+        loss_history["total"].append(total_loss.item())
+        loss_history["rgb"].append(rgb_loss.item())
+        loss_history["sil"].append(sil_loss.item())
+        loss_history["occl"].append(occlusion_loss.item())
+        loss_history["temp"].append(temporal_loss.item())
+        loss_history["anch"].append(anchor_loss.item())
 
         pbar.set_postfix(
             total=f"{total_loss.item():.4f}",
@@ -790,6 +819,30 @@ def main():
                 val_img = np.concatenate(rows, axis=0)
                 out_fname = os.path.join(val_dir, f"val_step{step:04d}.png")
                 imageio.imwrite(out_fname, val_img)
+
+    # -----------------------------------------------------------------------
+    # Save loss plot
+    # -----------------------------------------------------------------------
+    def ema(vals, alpha=0.02):
+        s, out = vals[0], [vals[0]]
+        for v in vals[1:]:
+            s = alpha * v + (1 - alpha) * s
+            out.append(s)
+        return out
+
+    fig, axes = plt.subplots(2, 3, figsize=(12, 6))
+    axes = axes.flatten()
+    for ax, (name, vals) in zip(axes, loss_history.items()):
+        ax.plot(vals, alpha=0.2, color="steelblue")
+        ax.plot(ema(vals), color="steelblue", linewidth=1.5)
+        ax.set_title(name)
+        ax.set_xlabel("step")
+        ax.grid(True)
+    plt.tight_layout()
+    plot_path = os.path.join(args.output_path, "loss_plot.png")
+    plt.savefig(plot_path, dpi=100)
+    plt.close()
+    print(f"\n  Loss plot: {plot_path}")
 
     # -----------------------------------------------------------------------
     # Save raw per-frame corrections

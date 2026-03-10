@@ -126,6 +126,30 @@ def load_all_colmap_cameras(scene_path):
     return result
 
 
+def compute_orig_rotation_from_colmap(scene_path, camera_idx, translation):
+    """Reproduce the R_orig that create_composite_4dgs.py computes from COLMAP."""
+    images_bin  = os.path.join(scene_path, "sparse", "0", "images.bin")
+    extrinsics  = read_extrinsics_binary(images_bin)
+    intrinsics  = read_intrinsics_binary(os.path.join(scene_path, "sparse", "0", "cameras.bin"))
+    sorted_imgs = sorted(extrinsics.values(), key=lambda x: x.name)
+    # world_up = mean -cam_down
+    downs     = np.stack([qvec2rotmat(si.qvec).T[:, 1] for si in sorted_imgs])
+    world_up  = -downs.mean(0); world_up /= np.linalg.norm(world_up)
+    # camera centre for camera_idx
+    img       = sorted_imgs[camera_idx]
+    R_w2c     = qvec2rotmat(img.qvec)
+    cam_center = -(R_w2c.T @ np.array(img.tvec, dtype=np.float64)).astype(np.float32)
+    # Build rotation (same as create_composite_4dgs.compute_fg_rotation, yaw_deg=0)
+    to_cam   = cam_center - np.array(translation, dtype=np.float64)
+    to_cam_h = to_cam - np.dot(to_cam, world_up) * world_up
+    if np.linalg.norm(to_cam_h) < 1e-6:
+        to_cam_h = np.array([1.0, 0.0, 0.0])
+    world_fwd   = to_cam_h / np.linalg.norm(to_cam_h)
+    world_right = np.cross(world_fwd, world_up)
+    world_right /= np.linalg.norm(world_right)
+    return np.stack([-world_fwd, world_right, world_up], axis=1).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # PLY loading
 # ---------------------------------------------------------------------------
@@ -379,6 +403,10 @@ def parse_args():
                         help="actionmesh output dir (contains gaussians/)")
     parser.add_argument("--placement_path", required=True,
                         help="placement_refined.json from refine_frame0.py (R, t, s)")
+    parser.add_argument("--original_placement_path", default=None,
+                        help="Original placement.json used by create_composite_4dgs.py "
+                             "(default: <composite_path>/gaussians/placement.json). "
+                             "Used to correct motion_coarse from R_orig to R_refined frame.")
     parser.add_argument("--gs_scene_path", required=True,
                         help="Inpaint360GS scene dir (sparse/0/)")
     parser.add_argument("--gs_model_path", required=True,
@@ -455,6 +483,29 @@ def main():
     print(f"  scale:       {s_base:.4f}")
     print(f"  translation: {t_base.tolist()}")
     print(f"  R det:       {np.linalg.det(R_base):.4f}")
+
+    # -----------------------------------------------------------------------
+    # Load original placement.json (from create_composite_4dgs) to correct motion frame
+    # -----------------------------------------------------------------------
+    orig_placement_path = args.original_placement_path or os.path.join(gaussians_dir, "placement.json")
+    print(f"\n--- Loading original placement for motion correction ({orig_placement_path}) ---")
+    with open(orig_placement_path) as f:
+        orig_placement = json.load(f)
+    s_orig = float(orig_placement["scale"])
+    if "rotation" in orig_placement:
+        R_orig = np.array(orig_placement["rotation"], dtype=np.float32)
+        print(f"  R_orig loaded from JSON")
+    else:
+        print(f"  'rotation' not in original placement JSON — computing from COLMAP")
+        t_orig = np.array(orig_placement["translation"], dtype=np.float32)
+        R_orig = compute_orig_rotation_from_colmap(args.gs_scene_path, args.camera_idx, t_orig)
+    print(f"  s_orig:  {s_orig:.4f}")
+    print(f"  R_orig det: {np.linalg.det(R_orig):.4f}")
+
+    # Correction matrix: re-expresses motion from R_orig frame to R_refined frame
+    # motion_want[t] = (s_refined/s_orig) * R_refined @ R_orig.T @ motion_raw[t]
+    correction = (s_base / s_orig) * (R_base @ R_orig.T)  # (3,3)
+    print(f"  correction norm: {np.linalg.norm(correction - np.eye(3)):.4f} (0=no change)")
 
     # -----------------------------------------------------------------------
     # Load foreground Gaussian attributes (canonical positions + appearance)
@@ -855,8 +906,12 @@ def main():
             delta_xyz_np = deform_mlp(xyz_norm_t).float().cpu().numpy()  # (N_fg, 3)
 
         # Anchor frame 0 to refined+deformed position; add animation motion on top.
-        motion_coarse = all_fg_pos_world - all_fg_pos_world[0:1]  # (T, N_fg, 3)
-        fg_pos_deformed = xyz_world_init_np[None] + motion_coarse + delta_xyz_np[None]
+        # motion_raw is in R_orig frame (from fg_positions_world.npy built with original placement).
+        # Re-express it in the refined placement frame via the correction matrix.
+        motion_raw = all_fg_pos_world - all_fg_pos_world[0:1]   # (T, N_fg, 3), R_orig frame
+        T_frames, N_pts = motion_raw.shape[:2]
+        motion_refined = (motion_raw.reshape(-1, 3) @ correction.T).reshape(T_frames, N_pts, 3)
+        fg_pos_deformed = xyz_world_init_np[None] + motion_refined + delta_xyz_np[None]
 
         deformed_path = os.path.join(gaussians_dir, "fg_positions_world_deformed.npy")
         np.save(deformed_path, fg_pos_deformed)
