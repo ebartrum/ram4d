@@ -919,6 +919,15 @@ def main():
         print(f"  Max |Δxyz|: {np.abs(delta_xyz_np).max():.6f}")
         print(f"  Mean |Δxyz|: {np.abs(delta_xyz_np).mean():.6f}")
 
+        # Save MLP deformation separately so downstream scripts can subtract it if needed
+        np.save(os.path.join(gaussians_dir, "delta_xyz_mlp.npy"), delta_xyz_np)
+        print(f"  Saved delta_xyz_mlp.npy: shape {delta_xyz_np.shape}")
+
+        # Save positions without MLP deformation (refined placement + coarse motion only)
+        fg_pos_no_mlp = (xyz_world_init_np[None] + motion_refined).astype(np.float32)
+        np.save(os.path.join(gaussians_dir, "fg_positions_world_no_mlp.npy"), fg_pos_no_mlp)
+        print(f"  Saved fg_positions_world_no_mlp.npy: shape {fg_pos_no_mlp.shape}")
+
     print("\nDone.")
     print(f"  MLP:         {mlp_path}")
     print(f"  Val images:  {val_dir}/")
