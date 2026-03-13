@@ -97,6 +97,8 @@ def parse_args():
     parser.add_argument("--render_output_dir", default=None,
                         help="Directory to save rendered video and frame0 image "
                              "(default: <output_path>/gaussians/)")
+    parser.add_argument("--frame_idx", type=int, default=None,
+                        help="If set, render only this animation frame and save as PNG (no video).")
     return parser.parse_args()
 
 
@@ -374,10 +376,18 @@ def main():
     else:
         n_render = T_fg   # one orbit pose (the fixed camera), repeated T_fg times
 
+    # --- Determine which frames to render ---
+    if args.frame_idx is not None:
+        if args.frame_idx >= T_fg:
+            print(f"  WARNING: frame_idx {args.frame_idx} >= T_fg {T_fg}, using {args.frame_idx % T_fg}")
+        frames_to_render = [args.frame_idx]
+    else:
+        frames_to_render = range(n_render)
+
     # --- Render ---
-    print(f"\n--- Rendering {n_render} frames at {W}×{H} ---")
+    print(f"\n--- Rendering {len(list(frames_to_render))} frame(s) at {W}×{H} ---")
     frames = []
-    for i in range(n_render):
+    for i in frames_to_render:
         pose_w2c = poses_w2c[i % len(poses_w2c)]
         t_fg     = 0 if args.static else i % T_fg
 
@@ -395,13 +405,23 @@ def main():
         frames.append(img)
 
         if i % 20 == 0:
-            print(f"  Frame {i}/{n_render}  (fg frame {t_fg})")
+            print(f"  Frame {i}  (fg frame {t_fg})")
 
     # --- Save ---
-    imageio.imwrite(out_frame0, frames[0])
-    print(f"\nFrame 0: {out_frame0}")
-    imageio.mimsave(out_video, frames, fps=args.fps)
-    print(f"Video:   {out_video}  ({len(frames)} frames @ {args.fps} fps  {W}×{H})")
+    if args.frame_idx is not None:
+        # Single-frame mode: save PNG only
+        if args.orbit:
+            png_name = f"orbit_frame{args.frame_idx}{suffix}.png"
+        else:
+            png_name = f"composite_cam{args.camera_idx}_frame{args.frame_idx}{suffix}.png"
+        png_path = os.path.join(render_dir, png_name)
+        imageio.imwrite(png_path, frames[0])
+        print(f"\nFrame: {png_path}")
+    else:
+        imageio.imwrite(out_frame0, frames[0])
+        print(f"\nFrame 0: {out_frame0}")
+        imageio.mimsave(out_video, frames, fps=args.fps)
+        print(f"Video:   {out_video}  ({len(frames)} frames @ {args.fps} fps  {W}×{H})")
 
 
 if __name__ == "__main__":

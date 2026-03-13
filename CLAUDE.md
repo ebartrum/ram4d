@@ -21,10 +21,15 @@ Code is **edited locally** (on this machine) and **executed remotely** on a GPU 
 
 Use `rsync` to push local changes to the server before running anything:
 ```bash
-rsync -av --exclude='.git' --exclude='/data' --exclude='/output' \
+rsync -av --exclude='.git' --exclude='/data' --exclude='/output' --exclude='Inpaint360GS/data' --exclude='Inpaint360GS/output' \
   /home/ed/Documents/repos/ram4d/ lambda_instance:~/repos/ram4d/
 ```
 (Data and output directories are large and live only on the server — do not sync them back.)
+
+**Exception**: `Inpaint360GS/data/inpaint360/<scene>/sparse/` (COLMAP camera files, ~51 MB) is needed by refine scripts. Sync it separately when setting up a fresh instance:
+```bash
+rsync -av /home/ed/Documents/repos/ram4d/Inpaint360GS/data/inpaint360/bag/sparse/ lambda_instance:~/repos/ram4d/Inpaint360GS/data/inpaint360/bag/sparse/
+```
 
 ### Running commands
 

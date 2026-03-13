@@ -25,8 +25,14 @@ Inputs:
 Per-frame transform at frame t:
   base_t       = fg_positions_world[t]
   centroid_t   = base_t.mean(0)
+  delta_s_t    = exp(log_delta_s[t])
   R_delta_t    = quat_to_matrix(normalise(delta_q[t]))
-  new_pos_t    = (R_delta_t @ (base_t - centroid_t).T).T + centroid_t + delta_t[t]
+  new_pos_t    = delta_s_t * (R_delta_t @ (base_t - centroid_t).T).T + centroid_t + delta_t[t]
+  scales_fg_t  = scales_fg_canon * delta_s_t
+
+ActionMesh normalises object size across frames, so later frames where the object
+is physically closer to the camera will appear the wrong scale without per-frame s.
+Each frame's log_delta_s is warm-started from the previous frame's solution.
 
 Outputs saved to composite_path/gaussians/:
   fg_positions_world_sequential.npy  (T, N_fg, 3)
@@ -34,6 +40,7 @@ Outputs saved to composite_path/gaussians/:
 Outputs saved to output_path/:
   delta_t_sequential.npy  (T, 3)
   delta_q_sequential.npy  (T, 4)
+  delta_s_sequential.npy  (T,)   — per-frame scale multiplier (exp of optimised log_delta_s)
   val/frame_{t:05d}.png   — 5-panel render after each frame's optimisation
 
 Usage:
@@ -104,21 +111,25 @@ def quat_to_matrix(q):
     ]).reshape(3, 3)
 
 
-def apply_rigid_frame(fg_pos_base, delta_q_t, delta_t_t):
+def apply_rigid_frame(fg_pos_base, delta_q_t, delta_t_t, delta_s_t=None):
     """
-    Apply rigid transform around the centroid of fg_pos_base.
+    Apply rigid (+ optional scale) transform around the centroid of fg_pos_base.
 
-    fg_pos_base : (N_fg, 3) — no grad (frame-0 world-space positions)
+    fg_pos_base : (N_fg, 3) — no grad (frame world-space positions)
     delta_q_t   : (4,)      — has grad (rotation quaternion)
     delta_t_t   : (3,)      — has grad (world-space translation)
+    delta_s_t   : scalar    — has grad (scale multiplier, default 1.0)
 
-    Returns: (N_fg, 3) — gradient flows through delta_q_t and delta_t_t.
+    Returns: (N_fg, 3) — gradient flows through all delta_* params.
     """
     q_norm   = delta_q_t / delta_q_t.norm()
     R        = quat_to_matrix(q_norm)               # (3, 3)
     centroid = fg_pos_base.mean(0)                  # (3,), no grad
     centered = fg_pos_base - centroid               # (N_fg, 3), no grad
-    new_pos  = centered @ R.T + centroid + delta_t_t
+    rotated  = centered @ R.T
+    if delta_s_t is not None:
+        rotated = delta_s_t * rotated
+    new_pos  = rotated + centroid + delta_t_t
     return new_pos
 
 
@@ -263,12 +274,26 @@ def parse_args():
                         help="Learning rate for delta_t (default: 10× --lr)")
     parser.add_argument("--lr_rot", type=float, default=None,
                         help="Learning rate for delta_q (default: --lr)")
+    parser.add_argument("--lr_s",   type=float, default=None,
+                        help="Learning rate for log_delta_s (default: --lr)")
     parser.add_argument("--render_scale", type=float, default=0.5,
                         help="Render scale relative to WAN frame resolution (default 0.5)")
     # Loss weights
     parser.add_argument("--rgb_weight",        type=float, default=1.0)
     parser.add_argument("--silhouette_weight", type=float, default=1.0)
     parser.add_argument("--occlusion_weight",  type=float, default=50.0)
+    parser.add_argument("--depth_weight",      type=float, default=0.0,
+                        help="Weight for DepthLab depth supervision loss (default 0 = disabled)")
+    # Single-frame mode
+    parser.add_argument("--target_frame", type=int, default=None,
+                        help="Optimise only this frame in isolation (no sequential warm-start). "
+                             "Saves fg_positions_frame{N}.npy to output_path/.")
+    # DepthLab settings
+    parser.add_argument("--depthlab_steps", type=int, default=20,
+                        help="DepthLab denoising steps (default 20)")
+    parser.add_argument("--depthlab_checkpoint_dir", type=str,
+                        default="submodules/DepthLab/checkpoints",
+                        help="Path to DepthLab checkpoints directory")
     return parser.parse_args()
 
 
@@ -276,7 +301,7 @@ def parse_args():
 # Val render helper
 # ---------------------------------------------------------------------------
 
-def save_val_frame(t, fg_pos_base, delta_q_t, delta_t_t,
+def save_val_frame(t, fg_pos_base, delta_q_t, delta_t_t, delta_s_t,
                    xyz_bg_t, colors_bg_t, alpha_bg_t, rot_bg_t, scales_bg_t,
                    colors_fg_t, alpha_fg_t, rot_fg_t, scales_fg_t,
                    N_bg, wan_frames_t, fg_masks_t,
@@ -284,13 +309,14 @@ def save_val_frame(t, fg_pos_base, delta_q_t, delta_t_t,
                    rW, rH, device, val_dir):
     """Render and save a 5-panel val image for frame t."""
     with torch.no_grad():
-        new_pos_v = apply_rigid_frame(fg_pos_base, delta_q_t, delta_t_t)
+        new_pos_v       = apply_rigid_frame(fg_pos_base, delta_q_t, delta_t_t, delta_s_t)
+        scales_fg_v     = scales_fg_t * delta_s_t
 
         means3D_v = torch.cat([xyz_bg_t,    new_pos_v],     dim=0)
         colors_v  = torch.cat([colors_bg_t, colors_fg_t],  dim=0)
         alphas_v  = torch.cat([alpha_bg_t,  alpha_fg_t],   dim=0)
         rots_v    = torch.cat([rot_bg_t,    rot_fg_t],     dim=0)
-        scales_v  = torch.cat([scales_bg_t, scales_fg_t],  dim=0)
+        scales_v  = torch.cat([scales_bg_t, scales_fg_v],  dim=0)
 
         color_v, _, _ = render_diff(
             means3D_v, colors_v, alphas_v, scales_v, rots_v,
@@ -312,7 +338,7 @@ def save_val_frame(t, fg_pos_base, delta_q_t, delta_t_t,
 
         # FG-only
         fg_only_v, _, _ = render_diff(
-            new_pos_v, colors_fg_t, alpha_fg_t, scales_fg_t, rot_fg_t,
+            new_pos_v, colors_fg_t, alpha_fg_t, scales_fg_v, rot_fg_t,
             src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
             rW, rH, device,
         )
@@ -328,6 +354,71 @@ def save_val_frame(t, fg_pos_base, delta_q_t, delta_t_t,
         panels  = [rendered_np, target_np, sil_rgb, gt_mask_rgb, fg_only_np]
         val_img = np.concatenate(panels, axis=1)
         imageio.imwrite(os.path.join(val_dir, f"frame_{t:05d}.png"), val_img)
+
+
+# ---------------------------------------------------------------------------
+# DepthLab helper
+# ---------------------------------------------------------------------------
+
+def _load_depthlab(checkpoint_dir, device):
+    """Load DepthLabPipeline from local checkpoints."""
+    import sys, types, torch.nn as _nn
+
+    # DualTransformer2DModel was removed from newer diffusers; inject a stub so
+    # DepthLab's unet_2d_blocks.py can import it (it's only instantiated for
+    # dual-stream configs, which the DepthLab checkpoint doesn't use).
+    if "diffusers.models.dual_transformer_2d" not in sys.modules:
+        _stub = types.ModuleType("diffusers.models.dual_transformer_2d")
+        class _DualTransformer2DModel(_nn.Module):
+            def __init__(self, *a, **kw): super().__init__()
+            def forward(self, *a, **kw): raise NotImplementedError("DualTransformer2DModel stub")
+        _stub.DualTransformer2DModel = _DualTransformer2DModel
+        sys.modules["diffusers.models.dual_transformer_2d"] = _stub
+
+    from diffusers import DDIMScheduler, AutoencoderKL
+    from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+    from src.models.unet_2d_condition import UNet2DConditionModel
+    from src.models.unet_2d_condition_main import UNet2DConditionModel_main
+    from src.models.projection import My_proj
+    from inference.depthlab_pipeline import DepthLabPipeline
+
+    marigold_dir  = os.path.join(checkpoint_dir, "marigold-depth-v1-0")
+    clip_dir      = os.path.join(checkpoint_dir, "CLIP-ViT-H-14-laion2B-s32B-b79K")
+    depthlab_dir  = os.path.join(checkpoint_dir, "DepthLab")
+
+    vae = AutoencoderKL.from_pretrained(marigold_dir, subfolder="vae")
+    text_encoder = CLIPTextModel.from_pretrained(marigold_dir, subfolder="text_encoder")
+    denoising_unet = UNet2DConditionModel_main.from_pretrained(
+        marigold_dir, subfolder="unet",
+        in_channels=12, sample_size=96,
+        low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
+    reference_unet = UNet2DConditionModel.from_pretrained(
+        marigold_dir, subfolder="unet",
+        in_channels=4, sample_size=96,
+        low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
+    image_enc = CLIPVisionModelWithProjection.from_pretrained(clip_dir)
+    mapping_layer = My_proj()
+    mapping_layer.load_state_dict(
+        torch.load(os.path.join(depthlab_dir, "mapping_layer.pth"), map_location="cpu"),
+        strict=False)
+    reference_unet.load_state_dict(
+        torch.load(os.path.join(depthlab_dir, "reference_unet.pth"), map_location="cpu"))
+    denoising_unet.load_state_dict(
+        torch.load(os.path.join(depthlab_dir, "denoising_unet.pth"), map_location="cpu"),
+        strict=False)
+    tokenizer = CLIPTokenizer.from_pretrained(marigold_dir, subfolder="tokenizer")
+    scheduler = DDIMScheduler.from_pretrained(marigold_dir, subfolder="scheduler")
+    pipe = DepthLabPipeline(
+        reference_unet=reference_unet,
+        denoising_unet=denoising_unet,
+        mapping_layer=mapping_layer,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        image_enc=image_enc,
+        scheduler=scheduler,
+    ).to(device)
+    return pipe
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +442,7 @@ def main():
 
     lr_t   = args.lr_t   if args.lr_t   is not None else args.lr * 10
     lr_rot = args.lr_rot if args.lr_rot is not None else args.lr
+    lr_s   = args.lr_s   if args.lr_s   is not None else args.lr
 
     # -----------------------------------------------------------------------
     # Placement — R, t, s from refine_frame0.py
@@ -452,6 +544,11 @@ def main():
     T = min(len(frame_files), len(mask_files), T_anim)
     if args.n_frames is not None:
         T = min(T, args.n_frames)
+    if args.target_frame is not None:
+        if args.target_frame >= T:
+            raise ValueError(
+                f"--target_frame {args.target_frame} out of range (only {T} frames available)"
+            )
     print(f"  Processing {T} frames")
 
     # GPU tensor for per-frame base positions
@@ -480,7 +577,7 @@ def main():
     bg_depth_color_map = None
     bg_occlusion_mask  = None
 
-    if args.occlusion_weight > 0:
+    if args.occlusion_weight > 0 or args.depth_weight > 0:
         print("\n--- Pre-rendering background depth ---")
         with torch.no_grad():
             bg_hom      = torch.cat([xyz_bg_t, torch.ones(N_bg, 1, device=device)], dim=1)
@@ -496,10 +593,59 @@ def main():
         print(f"  BG depth: non-zero px = {bg_occlusion_mask.sum().int().item()}")
 
     # -----------------------------------------------------------------------
+    # DepthLab depth target precompute
+    # -----------------------------------------------------------------------
+    depthlab_targets = None
+    if args.depth_weight > 0:
+        print("\n--- Running DepthLab depth completion ---")
+        sys.path.insert(0, os.path.join(_SCRIPT_DIR, "submodules", "DepthLab"))
+        # Use importlib to load image_util.py directly — avoids conflict with
+        # Inpaint360GS's utils package (which has __init__.py and wins sys.modules).
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            "depthlab_image_util",
+            os.path.join(_SCRIPT_DIR, "submodules", "DepthLab", "depthlab_utils", "image_util.py"),
+        )
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        get_filled_for_latents = _mod.get_filled_for_latents
+        pipe_dl = _load_depthlab(args.depthlab_checkpoint_dir, device)
+        bg_depth_np = bg_depth_color_map.cpu().numpy()   # (rH, rW), camera-space Z
+
+        frames_to_process = [args.target_frame] if args.target_frame is not None else range(T)
+        depthlab_targets = {}
+        for t_dl in frames_to_process:
+            rgb_np   = (wan_frames_t[t_dl].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            rgb_pil  = Image.fromarray(rgb_np)
+            mask_np  = fg_masks_t[t_dl].cpu().numpy()   # 1=fg=inpaint, 0=bg=known
+
+            # Fill unknown fg region with interpolated bg depth before latent encoding
+            bg_depth_filled = get_filled_for_latents(mask_np, bg_depth_np)
+
+            out = pipe_dl(
+                rgb_pil,
+                denosing_steps=args.depthlab_steps,
+                processing_res=max(rW, rH),
+                match_input_res=True,
+                depth_numpy_origin=bg_depth_filled,
+                mask_origin=mask_np,
+                blend=True,
+                strength=0.8,
+            )
+            # depth_np is the completed depth map; use depth_pred_numpy_origin for metric scale
+            depth_target = out.depth_pred_numpy_origin
+            depthlab_targets[t_dl] = torch.from_numpy(depth_target).float().to(device)
+            print(f"  Frame {t_dl}: depth range [{depth_target.min():.3f}, {depth_target.max():.3f}]")
+
+        del pipe_dl
+        torch.cuda.empty_cache()
+        print(f"  DepthLab targets computed for {len(depthlab_targets)} frame(s)")
+
+    # -----------------------------------------------------------------------
     # Sequential per-frame optimisation
     # -----------------------------------------------------------------------
     print(f"\n--- Sequential optimisation: {T} frames × {args.n_steps_per_frame} steps ---")
-    print(f"  lr_t={lr_t}  lr_rot={lr_rot}")
+    print(f"  lr_t={lr_t}  lr_rot={lr_rot}  lr_s={lr_s}")
 
     # Frame 0 initialisation: centroid offset from rough to refined placement.
     # This puts the object near the refine_frame0.py solution without needing R_orig.
@@ -508,36 +654,37 @@ def main():
     init_delta_t     = (centroid_refined - centroid_rough).detach()
     init_delta_q     = torch.tensor([1., 0., 0., 0.], device=device)
 
-    all_delta_t = []
-    all_delta_q = []
-
-    for t in tqdm(range(T), desc="Sequential frames"):
-        if t == 0:
-            delta_t = torch.nn.Parameter(init_delta_t.clone())
-            delta_q = torch.nn.Parameter(init_delta_q.clone())
-        else:
-            delta_t = torch.nn.Parameter(prev_delta_t.clone())
-            delta_q = torch.nn.Parameter(prev_delta_q.clone())
+    # ------------------------------------------------------------------
+    # Inner optimisation loop (shared by single-frame and sequential modes)
+    # ------------------------------------------------------------------
+    def _run_frame_opt(t, delta_t_init, delta_q_init, log_delta_s_init):
+        """Optimise rigid correction for frame t. Returns (delta_t, delta_q, log_delta_s)."""
+        delta_t     = torch.nn.Parameter(delta_t_init.clone())
+        delta_q     = torch.nn.Parameter(delta_q_init.clone())
+        log_delta_s = torch.nn.Parameter(log_delta_s_init.clone())
 
         optimizer = torch.optim.Adam([
-            {"params": [delta_t], "lr": lr_t},
-            {"params": [delta_q], "lr": lr_rot},
+            {"params": [delta_t],     "lr": lr_t},
+            {"params": [delta_q],     "lr": lr_rot},
+            {"params": [log_delta_s], "lr": lr_s},
         ])
 
-        fg_pos_base = fg_pos_world_t[t]   # (N_fg, 3), per-frame ActionMesh positions
+        fg_pos_base = fg_pos_world_t[t]
         target_t    = wan_frames_t[t]
         mask_t      = fg_masks_t[t]
 
         for _ in range(args.n_steps_per_frame):
             optimizer.zero_grad()
 
-            new_pos = apply_rigid_frame(fg_pos_base, delta_q, delta_t)
+            delta_s       = torch.exp(log_delta_s)
+            new_pos       = apply_rigid_frame(fg_pos_base, delta_q, delta_t, delta_s)
+            scales_fg_eff = scales_fg_t * delta_s
 
-            means3D = torch.cat([xyz_bg_t,    new_pos],      dim=0)
-            colors  = torch.cat([colors_bg_t, colors_fg_t], dim=0)
-            alphas  = torch.cat([alpha_bg_t,  alpha_fg_t],  dim=0)
-            rots    = torch.cat([rot_bg_t,    rot_fg_t],    dim=0)
-            scales  = torch.cat([scales_bg_t, scales_fg_t], dim=0)
+            means3D = torch.cat([xyz_bg_t,    new_pos],       dim=0)
+            colors  = torch.cat([colors_bg_t, colors_fg_t],   dim=0)
+            alphas  = torch.cat([alpha_bg_t,  alpha_fg_t],    dim=0)
+            rots    = torch.cat([rot_bg_t,    rot_fg_t],      dim=0)
+            scales  = torch.cat([scales_bg_t, scales_fg_eff], dim=0)
 
             color_render, _, _ = render_diff(
                 means3D, colors, alphas, scales, rots,
@@ -567,31 +714,109 @@ def main():
                     )
                 total_loss = total_loss + args.silhouette_weight * sil_loss
 
-            # Occlusion: penalise fg Gaussians behind bg
-            if args.occlusion_weight > 0 and bg_depth_color_map is not None:
+            # Shared fg-depth render (used by occlusion and/or DepthLab depth loss)
+            fg_depth_render_map = None
+            need_fg_depth = (
+                (args.occlusion_weight > 0 and bg_depth_color_map is not None) or
+                (args.depth_weight > 0 and depthlab_targets is not None and t in depthlab_targets)
+            )
+            if need_fg_depth:
                 fg_hom      = torch.cat([new_pos, torch.ones(N_fg, 1, device=device)], dim=1)
                 fg_z        = (fg_hom @ src_viewmat)[:, 2]
                 fg_z_colors = fg_z.unsqueeze(1).expand(-1, 3).float()
                 fg_depth_render, _, _ = render_diff(
-                    new_pos, fg_z_colors, alpha_fg_t, scales_fg_t, rot_fg_t,
+                    new_pos, fg_z_colors, alpha_fg_t, scales_fg_eff, rot_fg_t,
                     src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
                     rW, rH, device,
                 )
+                fg_depth_render_map = fg_depth_render[0]   # (rH, rW)
+
+            # Occlusion: penalise fg Gaussians behind bg
+            if args.occlusion_weight > 0 and bg_depth_color_map is not None:
                 occ_loss = (
-                    F.relu(fg_depth_render[0] - bg_depth_color_map) ** 2 * bg_occlusion_mask
+                    F.relu(fg_depth_render_map - bg_depth_color_map) ** 2 * bg_occlusion_mask
                 ).sum() / (bg_occlusion_mask.sum() + 1e-6)
                 total_loss = total_loss + args.occlusion_weight * occ_loss
+
+            # DepthLab depth supervision
+            if args.depth_weight > 0 and depthlab_targets is not None and t in depthlab_targets:
+                fg_mask_bool = mask_t.bool()
+                depth_loss = F.l1_loss(
+                    fg_depth_render_map[fg_mask_bool],
+                    depthlab_targets[t][fg_mask_bool],
+                )
+                total_loss = total_loss + args.depth_weight * depth_loss
 
             total_loss.backward()
             optimizer.step()
 
-        prev_delta_t = delta_t.detach()
-        prev_delta_q = delta_q.detach()
-        all_delta_t.append(prev_delta_t.cpu().numpy())
-        all_delta_q.append(prev_delta_q.cpu().numpy())
+        return delta_t.detach(), delta_q.detach(), log_delta_s.detach()
+
+    # ------------------------------------------------------------------
+    # Single-frame mode
+    # ------------------------------------------------------------------
+    if args.target_frame is not None:
+        t = args.target_frame
+        print(f"\n--- Single-frame optimisation: frame {t} × {args.n_steps_per_frame} steps ---")
+
+        delta_t, delta_q, log_delta_s = _run_frame_opt(
+            t,
+            delta_t_init=torch.zeros(3, device=device),
+            delta_q_init=torch.tensor([1., 0., 0., 0.], device=device),
+            log_delta_s_init=torch.tensor(0.0, device=device),
+        )
 
         save_val_frame(
-            t, fg_pos_base, prev_delta_q, prev_delta_t,
+            t, fg_pos_world_t[t], delta_q, delta_t, torch.exp(log_delta_s),
+            xyz_bg_t, colors_bg_t, alpha_bg_t, rot_bg_t, scales_bg_t,
+            colors_fg_t, alpha_fg_t, rot_fg_t, scales_fg_t,
+            N_bg, wan_frames_t, fg_masks_t,
+            src_viewmat, src_fullproj, src_campos, src_tfovx, src_tfovy,
+            rW, rH, device, val_dir,
+        )
+
+        # Save corrected positions for this frame
+        with torch.no_grad():
+            final_pos = apply_rigid_frame(
+                fg_pos_world_t[t], delta_q, delta_t, torch.exp(log_delta_s)
+            )
+        out_npy = os.path.join(args.output_path, f"fg_positions_frame{t}.npy")
+        np.save(out_npy, final_pos.cpu().numpy()[None])  # (1, N_fg, 3)
+        print(f"\nDone.  Saved: {out_npy}")
+        print(f"  Val render: {val_dir}/frame_{t:05d}.png")
+        print(f"\nNext: render with --fg_positions_path {out_npy} --frame_idx 0")
+        return
+
+    # ------------------------------------------------------------------
+    # Sequential mode
+    # ------------------------------------------------------------------
+    all_delta_t = []
+    all_delta_q = []
+    all_delta_s = []
+
+    prev_delta_t     = init_delta_t
+    prev_delta_q     = init_delta_q
+    prev_log_delta_s = torch.tensor(0.0, device=device)
+
+    for t in tqdm(range(T), desc="Sequential frames"):
+        if t == 0:
+            dt_init  = init_delta_t.clone()
+            dq_init  = init_delta_q.clone()
+            dls_init = torch.tensor(0.0, device=device)
+        else:
+            dt_init  = prev_delta_t.clone()
+            dq_init  = prev_delta_q.clone()
+            dls_init = prev_log_delta_s.clone()
+
+        prev_delta_t, prev_delta_q, prev_log_delta_s = _run_frame_opt(
+            t, dt_init, dq_init, dls_init
+        )
+        all_delta_t.append(prev_delta_t.cpu().numpy())
+        all_delta_q.append(prev_delta_q.cpu().numpy())
+        all_delta_s.append(torch.exp(prev_log_delta_s).cpu().item())
+
+        save_val_frame(
+            t, fg_pos_world_t[t], prev_delta_q, prev_delta_t, torch.exp(prev_log_delta_s),
             xyz_bg_t, colors_bg_t, alpha_bg_t, rot_bg_t, scales_bg_t,
             colors_fg_t, alpha_fg_t, rot_fg_t, scales_fg_t,
             N_bg, wan_frames_t, fg_masks_t,
@@ -603,12 +828,15 @@ def main():
     # Save corrections
     # -----------------------------------------------------------------------
     print("\n--- Saving corrections ---")
-    delta_t_arr = np.stack(all_delta_t)   # (T, 3)
-    delta_q_arr = np.stack(all_delta_q)   # (T, 4)
+    delta_t_arr = np.stack(all_delta_t)          # (T, 3)
+    delta_q_arr = np.stack(all_delta_q)          # (T, 4)
+    delta_s_arr = np.array(all_delta_s)          # (T,)
     np.save(os.path.join(args.output_path, "delta_t_sequential.npy"), delta_t_arr)
     np.save(os.path.join(args.output_path, "delta_q_sequential.npy"), delta_q_arr)
+    np.save(os.path.join(args.output_path, "delta_s_sequential.npy"), delta_s_arr)
     print(f"  |Δt| max:     {np.linalg.norm(delta_t_arr, axis=1).max():.4f}")
     print(f"  |Δq - I| max: {np.abs(delta_q_arr - np.array([[1,0,0,0]])).max():.4f}")
+    print(f"  Δs range:     [{delta_s_arr.min():.4f}, {delta_s_arr.max():.4f}]")
 
     # -----------------------------------------------------------------------
     # Compute and save fg_positions_world_sequential.npy
@@ -619,7 +847,8 @@ def main():
         for t in range(T):
             dq = torch.from_numpy(delta_q_arr[t]).float().to(device)
             dt = torch.from_numpy(delta_t_arr[t]).float().to(device)
-            dynamic_positions[t] = apply_rigid_frame(fg_pos_world_t[t], dq, dt).cpu().numpy()
+            ds = torch.tensor(delta_s_arr[t], device=device)
+            dynamic_positions[t] = apply_rigid_frame(fg_pos_world_t[t], dq, dt, ds).cpu().numpy()
 
     seq_path = os.path.join(gaussians_dir, "fg_positions_world_sequential.npy")
     np.save(seq_path, dynamic_positions)
