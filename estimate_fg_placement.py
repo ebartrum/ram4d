@@ -359,8 +359,10 @@ def main():
         calibrated_depth, fg_mask, R_c2w, tvec, FoVx, FoVy, wan_W, wan_H
     )
 
-    # Scale: 4DGS is normalised to ~1 world unit; use max horizontal/vertical extent
-    scale = float(np.max(extent))
+    # Scale: 4DGS is normalised to ~1 world unit; use median extent across dimensions.
+    # Median is robust to objects with spread-out features (e.g. tentacles, wings) where
+    # one axis is inflated while the other two capture the characteristic body size.
+    scale = float(np.median(extent))
 
     # --- Per-frame translations ---
     # Re-use the same depth calibration (a, b) — background is static — and run
