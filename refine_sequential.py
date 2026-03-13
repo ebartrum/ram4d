@@ -673,7 +673,7 @@ def main():
         target_t    = wan_frames_t[t]
         mask_t      = fg_masks_t[t]
 
-        for _ in range(args.n_steps_per_frame):
+        for step in range(args.n_steps_per_frame):
             optimizer.zero_grad()
 
             delta_s       = torch.exp(log_delta_s)
@@ -717,8 +717,7 @@ def main():
             # Shared fg-depth render (used by occlusion and/or DepthLab depth loss)
             fg_depth_render_map = None
             need_fg_depth = (
-                (args.occlusion_weight > 0 and bg_depth_color_map is not None) or
-                (args.depth_weight > 0 and depthlab_targets is not None and t in depthlab_targets)
+                args.depth_weight > 0 and depthlab_targets is not None and t in depthlab_targets
             )
             if need_fg_depth:
                 fg_hom      = torch.cat([new_pos, torch.ones(N_fg, 1, device=device)], dim=1)
@@ -731,10 +730,35 @@ def main():
                 )
                 fg_depth_render_map = fg_depth_render[0]   # (rH, rW)
 
-            # Occlusion: penalise fg Gaussians behind bg
+            # Per-Gaussian occlusion: penalise every fg Gaussian whose camera-Z
+            # exceeds the bg depth at its projected pixel. Unlike the rendered
+            # approach (which only sees the frontmost fg Gaussian per pixel), this
+            # catches all Gaussians regardless of mutual fg occlusion — e.g. back
+            # tentacles or paws hidden behind the body. Loss is 0 when no Gaussian
+            # is behind the bg surface.
+            occ_loss = None
             if args.occlusion_weight > 0 and bg_depth_color_map is not None:
+                fg_hom_pg  = torch.cat([new_pos, torch.ones(N_fg, 1, device=device)], dim=1)
+                fg_clip_pg = fg_hom_pg @ src_fullproj              # (N_fg, 4)
+                fg_z_pg    = (fg_hom_pg @ src_viewmat)[:, 2]       # (N_fg,) camera-Z
+                fg_ndc_pg  = fg_clip_pg[:, :2] / fg_clip_pg[:, 3:4]
+
+                px_pg = ((fg_ndc_pg[:, 0] + 1.0) * 0.5 * rW).long()
+                py_pg = ((fg_ndc_pg[:, 1] + 1.0) * 0.5 * rH).long()
+
+                valid_pg = (fg_clip_pg[:, 3] > 0) \
+                         & (px_pg >= 0) & (px_pg < rW) \
+                         & (py_pg >= 0) & (py_pg < rH)
+
+                px_v = px_pg[valid_pg].clamp(0, rW - 1)
+                py_v = py_pg[valid_pg].clamp(0, rH - 1)
+                fg_z_v = fg_z_pg[valid_pg]
+
+                bg_depth_v = bg_depth_color_map[py_v, px_v]
+                bg_mask_v  = bg_occlusion_mask[py_v, px_v]
+
                 occ_loss = (
-                    F.relu(fg_depth_render_map - bg_depth_color_map) ** 2 * bg_occlusion_mask
+                    F.relu(fg_z_v - bg_depth_v) ** 2 * bg_mask_v
                 ).sum() / (bg_occlusion_mask.sum() + 1e-6)
                 total_loss = total_loss + args.occlusion_weight * occ_loss
 
@@ -749,6 +773,14 @@ def main():
 
             total_loss.backward()
             optimizer.step()
+
+            if step % 20 == 0 or step == args.n_steps_per_frame - 1:
+                log_parts = [f"step {step:4d}  total={total_loss.item():.4f}"]
+                if args.occlusion_weight > 0 and bg_depth_color_map is not None:
+                    log_parts.append(f"occ={occ_loss.item():.4f}")
+                if args.depth_weight > 0 and depthlab_targets is not None and t in depthlab_targets:
+                    log_parts.append(f"depth={depth_loss.item():.4f}")
+                print("  " + "  ".join(log_parts))
 
         return delta_t.detach(), delta_q.detach(), log_delta_s.detach()
 

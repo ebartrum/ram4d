@@ -5,7 +5,7 @@ python refine_sequential.py \
     --gs_scene_path Inpaint360GS/data/inpaint360/bag \
     --gs_model_path output/2026.02.26/inpainted_scene/point_cloud_object_inpaint_virtual \
     --camera_idx 28 \
-    --output_path output/2026.03.13/corgi_sequential_81_depth \
+    --output_path output/2026.03.13/corgi_sequential_81_depth_v2 \
     --n_steps_per_frame 50 \
     --n_frames 81 \
     --rgb_weight 1.0 --silhouette_weight 1.0 --occlusion_weight 50.0 \

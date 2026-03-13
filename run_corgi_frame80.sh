@@ -8,10 +8,10 @@ COMPOSITE=output/2026.03.03/actionmesh_gs_replace_corgi
 PLACEMENT=output/2026.03.09/corgi_refined_consistent_occl/placement_refined.json
 SCENE=Inpaint360GS/data/inpaint360/bag
 MODEL=output/2026.02.26/inpainted_scene/point_cloud_object_inpaint_virtual
-OUT=output/2026.03.13/corgi_frame80_dw01
+OUT=output/2026.03.13/corgi_frame80_dw01_v5
 
 mkdir -p $OUT
-mkdir -p output/2026.03.13/corgi_frame80_dw01_result
+mkdir -p output/2026.03.13/corgi_frame80_dw01_v5_result
 
 # --- Optimise frame 80 with DepthLab depth supervision ---
 python refine_sequential.py \
@@ -25,7 +25,7 @@ python refine_sequential.py \
     --target_frame 80 \
     --rgb_weight 1.0 \
     --silhouette_weight 1.0 \
-    --occlusion_weight 50.0 \
+    --occlusion_weight 5.0 \
     --depth_weight 0.1 \
     --render_scale 0.5
 
@@ -37,7 +37,7 @@ python render_composite_4dgs.py \
     --gs_model_path $MODEL \
     --fg_positions_path $OUT/fg_positions_frame80.npy \
     --placement_path $PLACEMENT \
-    --render_output_dir output/2026.03.13/corgi_frame80_dw01_result \
+    --render_output_dir output/2026.03.13/corgi_frame80_dw01_v5_result \
     --camera_idx 22 \
     --render_scale 0.5 \
     --frame_idx 0
@@ -48,10 +48,10 @@ python render_composite_4dgs.py \
     --gs_model_path $MODEL \
     --fg_positions_path $OUT/fg_positions_frame80.npy \
     --placement_path $PLACEMENT \
-    --render_output_dir output/2026.03.13/corgi_frame80_dw01_result \
+    --render_output_dir output/2026.03.13/corgi_frame80_dw01_v5_result \
     --camera_idx 28 \
     --render_scale 0.5 \
     --frame_idx 0
 
-echo "Done. Results in output/2026.03.13/corgi_frame80_dw01_result/"
+echo "Done. Results in output/2026.03.13/corgi_frame80_dw01_v5_result/"
 echo "  Compare against baseline in output/2026.03.13/corgi_frame80_baseline/"

@@ -15,7 +15,7 @@ python render_composite_4dgs.py \
     --gs_model_path $MODEL \
     --fg_positions_path $FG_POS \
     --placement_path $PLACEMENT \
-    --render_output_dir output/2026.03.13/corgi_sequential_81_cam22 \
+    --render_output_dir output/2026.03.13/corgi_sequential_v2_cam22 \
     --camera_idx 22 \
     --render_scale 0.5
 
@@ -26,7 +26,7 @@ python render_composite_4dgs.py \
     --gs_model_path $MODEL \
     --fg_positions_path $FG_POS \
     --placement_path $PLACEMENT \
-    --render_output_dir output/2026.03.13/corgi_sequential_81_cam28 \
+    --render_output_dir output/2026.03.13/corgi_sequential_v2_cam28 \
     --camera_idx 28 \
     --render_scale 0.5
 
