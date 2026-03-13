@@ -10,3 +10,6 @@
 [submodule "official_wan_repo"]
 	path = official_wan_repo
 	url = https://github.com/Wan-Video/Wan2.1.git
+[submodule "submodules/DepthLab"]
+	path = submodules/DepthLab
+	url = git@github.com:ebartrum/DepthLab.git
