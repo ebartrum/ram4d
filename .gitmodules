@@ -13,3 +13,6 @@
 [submodule "submodules/DepthLab"]
 	path = submodules/DepthLab
 	url = git@github.com:ebartrum/DepthLab.git
+[submodule "Wan-Move"]
+	path = Wan-Move
+	url = git@github.com:ebartrum/Wan-Move.git
