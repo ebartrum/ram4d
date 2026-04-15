@@ -41,7 +41,9 @@ import cv2
 
 def main():
     parser = argparse.ArgumentParser(description="Wan Corgi Attention Experiment")
-    parser.add_argument("--bg_image", type=str, default="data/images/plain_bg.png", help="Path to background image")
+    parser.add_argument("--bg_image", type=str, default=None, help="Path to background image (static; use --bg_video for per-frame bg)")
+    parser.add_argument("--bg_video", type=str, default=None, help="Path to background video (overrides --bg_image)")
+    parser.add_argument("--mask_video", type=str, default=None, help="Path to mask video (white=fg, black=bg). If provided, skips SAM2/attention and uses pre-computed masks.")
     parser.add_argument("--input_image", type=str, default="data/images/corgi_on_plain_bg.png", help="Path to input image (with corgi)")
     parser.add_argument("--prompt_path", type=str, default="data/captions/corgi_video.txt", help="Path to text prompt")
     parser.add_argument("--frame_num", type=int, default=81, help="Number of frames")
@@ -93,32 +95,48 @@ def main():
     # 1. Prepare Data
     # ------------------------------------------------------------------
     
-    # Load images
-    print(f"Loading background: {args.bg_image}")
-    bg_img = Image.open(args.bg_image).convert("RGB").resize((args.width, args.height))
-
+    # Load input (I2V conditioning) image
     print(f"Loading input: {args.input_image}")
     input_img = Image.open(args.input_image).convert("RGB").resize((args.width, args.height))
-    
+
     with open(args.prompt_path, "r") as f:
         prompt = f.read().strip()
     print(f"Prompt: {prompt}")
 
     # ------------------------------------------------------------------
-    # 2. Encode Background to Latents (Static Video)
+    # 2. Encode Background to Latents
     # ------------------------------------------------------------------
     frame_num = args.frame_num
-    
-    # Create static video tensor from BG
-    bg_tensor = TF.to_tensor(bg_img).sub_(0.5).div_(0.5).to(device) # [3, H, W]
-    bg_video = bg_tensor.unsqueeze(1).repeat(1, frame_num, 1, 1).unsqueeze(0) # [1, 3, F, H, W]
-    
+
+    if args.bg_video is not None:
+        print(f"Loading background video: {args.bg_video}")
+        cap = cv2.VideoCapture(args.bg_video)
+        bg_frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame).resize((args.width, args.height))
+            bg_frames.append(TF.to_tensor(frame_pil).sub_(0.5).div_(0.5))
+        cap.release()
+        # Pad or truncate to frame_num
+        while len(bg_frames) < frame_num:
+            bg_frames.extend(bg_frames[:frame_num - len(bg_frames)])
+        bg_frames = bg_frames[:frame_num]
+        bg_video_tensor = torch.stack(bg_frames, dim=1).to(device)  # [3, F, H, W]
+    else:
+        assert args.bg_image is not None, "Must provide either --bg_image or --bg_video"
+        print(f"Loading background image: {args.bg_image}")
+        bg_img = Image.open(args.bg_image).convert("RGB").resize((args.width, args.height))
+        bg_tensor = TF.to_tensor(bg_img).sub_(0.5).div_(0.5).to(device)  # [3, H, W]
+        bg_video_tensor = bg_tensor.unsqueeze(1).repeat(1, frame_num, 1, 1)  # [3, F, H, W]
+
     print("Encoding background video...")
     with torch.no_grad():
-        # vae.encode expects list of [3, F, H, W]
-        # returns list of [C, F_lat, H_lat, W_lat]
-        bg_latents = wan_i2v.vae.encode([bg_video.squeeze(0)])[0]
-        bg_latents = bg_latents.unsqueeze(0) # [1, C, F, H, W]
+        bg_latents = wan_i2v.vae.encode([bg_video_tensor])[0]
+        bg_latents = bg_latents.unsqueeze(0)  # [1, C, F_lat, H_lat, W_lat]
+    del bg_video_tensor
     # Derive latent spatial dims from bg_latents directly (more reliable than formula for non-square)
     lat_h = bg_latents.shape[-2]
     lat_w = bg_latents.shape[-1]
@@ -236,6 +254,34 @@ def main():
     arg_null = {'context': context_null, 'clip_fea': clip_context, 'seq_len': max_seq_len, 'y': [y]}
     
     # ------------------------------------------------------------------
+    # Precompute mask from mask video (if provided)
+    # ------------------------------------------------------------------
+    fg_mask_precomputed = None
+    if args.mask_video is not None:
+        f_lat = (frame_num - 1) // 4 + 1
+        print(f"Loading mask video: {args.mask_video}")
+        cap = cv2.VideoCapture(args.mask_video)
+        mask_frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, (args.width, args.height), interpolation=cv2.INTER_NEAREST)
+            mask_frames.append(torch.from_numpy((gray > 128).astype(np.float32)))
+        cap.release()
+        while len(mask_frames) < frame_num:
+            mask_frames.extend(mask_frames[:frame_num - len(mask_frames)])
+        mask_frames = mask_frames[:frame_num]
+        mask_vid = torch.stack(mask_frames).unsqueeze(0).unsqueeze(0)  # [1, 1, F, H, W]
+        fg_mask_precomputed = torch.nn.functional.adaptive_max_pool3d(
+            mask_vid, output_size=(f_lat, lat_h, lat_w)
+        )
+        fg_mask_precomputed = (fg_mask_precomputed > 0.5).float().to(device)  # [1, 1, F_lat, H_lat, W_lat]
+        fg_mask_precomputed = fg_mask_precomputed.repeat(1, 16, 1, 1, 1)       # [1, 16, F_lat, H_lat, W_lat]
+        print(f"Mask video loaded: {fg_mask_precomputed.shape}, fg fraction: {fg_mask_precomputed.mean():.3f}")
+
+    # ------------------------------------------------------------------
     # Initialize SAM2 and TinyVAE
     # ------------------------------------------------------------------
     sam2_predictor = None
@@ -251,7 +297,7 @@ def main():
     else:
         print(f"WARNING: TinyVAE checkpoint not found at {tiny_vae_path}. Debug decoding will be slow.")
 
-    if args.mask_method == "sam2":
+    if args.mask_method == "sam2" and args.mask_video is None:
         print("Initializing SAM2...")
         
         # SAM2
@@ -275,8 +321,12 @@ def main():
         initial_mask_binary = (mask_np > 128).astype(np.float32)
         print(f"Loaded initial mask from {mask_path}")
 
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    wan_i2v.model = wan_i2v.model.to(torch.bfloat16)
     wan_i2v.model.to(device)
-    
+
     print("Starting generation...")
     # Initial Latents (Noise)
     # Note: 'latent' is already initialized to 'noise'.
@@ -347,11 +397,14 @@ def main():
             latent_next = temp_x0.squeeze(0)
             
             # --------------------------------------------------------------
-            # Extract Attention Mask / SAM2 Mask
+            # Extract Attention Mask / SAM2 Mask / Precomputed Video Mask
             # --------------------------------------------------------------
             final_mask = torch.zeros_like(latent).to(device)
 
-            if args.mask_method == "attention" and "weights" in ATTENTION_STORE:
+            if fg_mask_precomputed is not None:
+                final_mask = fg_mask_precomputed
+                binary_mask = fg_mask_precomputed[:, 0]  # [1, F_lat, H_lat, W_lat] for viz
+            elif args.mask_method == "attention" and "weights" in ATTENTION_STORE:
                 all_maps = ATTENTION_STORE["weights"]
                 # Structure: Self, CrossImg, CrossText per block.
                 # Total blocks: 32. Total maps expected: 96.
