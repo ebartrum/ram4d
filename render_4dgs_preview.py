@@ -12,8 +12,8 @@ Camera placed at CAM_DIST=100 with tanfov=HALF_FOV/CAM_DIST for near-orthographi
 projection matching the existing 4-view layout (HALF_FOV=0.55 world units).
 
 Usage:
-  python render_4dgs_preview.py --output_path output/2026.03.02/actionmesh_gs_replace_corgi
-  python render_4dgs_preview.py --output_path ... --size 768 --fps 16
+  python render_4dgs_preview.py --gaussians_dir output/2026.04.15/corgi_gaussians
+  python render_4dgs_preview.py --gaussians_dir ... --size 768 --fps 16
 """
 
 import sys
@@ -56,7 +56,8 @@ DEFAULT_AZIMUTHS_DEG = [180, -90, 0, 90]
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output_path", required=True)
+    parser.add_argument("--gaussians_dir", required=True,
+                        help="Directory containing gaussians.ply and deformation_offsets.npy.")
     parser.add_argument("--size", type=int, default=768,
                         help="Per-view image size (square). Default 768.")
     parser.add_argument("--fps", type=int, default=16)
@@ -180,7 +181,7 @@ def render_view(means3D, colors, opacities, scales, rotations,
 
 def main():
     args = parse_args()
-    gaussians_dir = os.path.join(args.output_path, "gaussians")
+    gaussians_dir = args.gaussians_dir
     ply_path      = os.path.join(gaussians_dir, "gaussians.ply")
     offsets_path  = os.path.join(gaussians_dir, "deformation_offsets.npy")
 

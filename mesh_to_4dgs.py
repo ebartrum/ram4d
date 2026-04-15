@@ -6,12 +6,12 @@ motivated scale and orientation (mesh2splat approach). Deformation offsets are
 computed per frame as centroid displacements.
 
 Outputs:
-  <output_path>/gaussians/gaussians.ply         — 3DGS PLY (Inpaint360GS compatible)
-  <output_path>/gaussians/deformation_offsets.npy — (T, N_tri, 3) xyz offsets
+  <output_dir>/gaussians.ply         — 3DGS PLY (Inpaint360GS compatible)
+  <output_dir>/deformation_offsets.npy — (T, N_tri, 3) xyz offsets
 
 Usage:
-  python mesh_to_4dgs.py --output_path output/2026.03.02/actionmesh_gs_replace_corgi
-  python mesh_to_4dgs.py --output_path ... --sigma 0.65
+  python mesh_to_4dgs.py --input_mesh output/2026.03.03/actionmesh_gs_replace_corgi --output_dir output/2026.04.15/corgi_gaussians
+  python mesh_to_4dgs.py --input_mesh ... --output_dir ... --sigma 0.65
 """
 
 import sys
@@ -57,8 +57,12 @@ def parse_args():
         description="Convert dynamic ActionMesh output to 4D Gaussian Splatting."
     )
     parser.add_argument(
-        "--output_path", required=True,
+        "--input_mesh", required=True,
         help="ActionMesh output dir (from run_actionmesh.py / texture_actionmesh.py)."
+    )
+    parser.add_argument(
+        "--output_dir", required=True,
+        help="Directory to write gaussians.ply and deformation_offsets.npy."
     )
     parser.add_argument(
         "--sigma", type=float, default=0.65,
@@ -411,10 +415,10 @@ def write_gaussians_ply(path, centroid, log_scale, quaternion, f_dc, opacity, nu
 
 def main():
     args = parse_args()
-    output_path = args.output_path
-    texture_dir = os.path.join(output_path, "texture")
-    deformations_path = os.path.join(output_path, "deformations_vertices.npy")
-    gaussians_dir = os.path.join(output_path, "gaussians")
+    input_mesh = args.input_mesh
+    texture_dir = os.path.join(input_mesh, "texture")
+    deformations_path = os.path.join(input_mesh, "deformations_vertices.npy")
+    gaussians_dir = args.output_dir
 
     # --- Load texture image ---
     print("\n--- Loading texture ---")
