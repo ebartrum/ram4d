@@ -2,3 +2,4 @@ data
 output
 checkpoints
 pretrained_weights
+*.sh
