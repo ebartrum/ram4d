@@ -398,6 +398,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--composite_path", required=True,
                         help="gaussians dir (contains gaussians.ply, placement.json)")
+    parser.add_argument("--placement_path", default=None,
+                        help="Override path to placement.json (default: <composite_path>/placement.json)")
     parser.add_argument("--gs_scene_path", required=True,
                         help="Inpaint360GS scene dir (sparse/0/)")
     parser.add_argument("--gs_model_path", required=True,
@@ -477,7 +479,7 @@ def main():
     os.makedirs(args.output_path, exist_ok=True)
 
     gaussians_dir  = args.composite_path
-    placement_path = os.path.join(gaussians_dir, "placement.json")
+    placement_path = args.placement_path or os.path.join(gaussians_dir, "placement.json")
     fg_ply_path    = os.path.join(gaussians_dir, "gaussians.ply")
     out_json       = os.path.join(args.output_path, "placement_refined.json")
     debug_dir       = os.path.join(args.output_path, "debug")
