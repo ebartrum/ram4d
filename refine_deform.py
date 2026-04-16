@@ -461,7 +461,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_path, exist_ok=True)
 
-    gaussians_dir   = os.path.join(args.composite_path, "gaussians")
+    gaussians_dir   = args.composite_path
     fg_ply_path     = os.path.join(gaussians_dir, "gaussians.ply")
     fg_pos_world_path = os.path.join(gaussians_dir, "fg_positions_world.npy")
     debug_dir       = os.path.join(args.output_path, "debug")

@@ -288,7 +288,7 @@ def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    gaussians_dir     = os.path.join(args.output_path, "gaussians")
+    gaussians_dir     = args.output_path
     fg_positions_path = args.fg_positions_path or os.path.join(gaussians_dir, "fg_positions_world.npy")
     fg_ply_path       = os.path.join(gaussians_dir, "gaussians.ply")
     placement_path    = args.placement_path or os.path.join(gaussians_dir, "placement.json")

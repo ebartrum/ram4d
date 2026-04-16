@@ -397,7 +397,7 @@ def compute_flux_pseudogt(flux_pipe, bg_rgb_uint8, mask_uint8, prompt, W, H,
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--composite_path", required=True,
-                        help="ram4d output dir (contains gaussians/)")
+                        help="gaussians dir (contains gaussians.ply, placement.json)")
     parser.add_argument("--gs_scene_path", required=True,
                         help="Inpaint360GS scene dir (sparse/0/)")
     parser.add_argument("--gs_model_path", required=True,
@@ -476,7 +476,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_path, exist_ok=True)
 
-    gaussians_dir  = os.path.join(args.composite_path, "gaussians")
+    gaussians_dir  = args.composite_path
     placement_path = os.path.join(gaussians_dir, "placement.json")
     fg_ply_path    = os.path.join(gaussians_dir, "gaussians.ply")
     out_json       = os.path.join(args.output_path, "placement_refined.json")

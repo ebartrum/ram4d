@@ -6,9 +6,9 @@ transform to the foreground 4DGS canonical positions and deformation offsets, an
 per-frame world-space foreground positions as fg_positions_world.npy.
 
 The composite 4DGS is fully described by:
-  - gaussians/fg_positions_world.npy  — (T, N_fg, 3) per-frame world-space positions
-  - gaussians/gaussians.ply           — foreground Gaussian attributes (colours, opacities,
-                                        scales, rotations)
+  - <output_path>/fg_positions_world.npy  — (T, N_fg, 3) per-frame world-space positions
+  - <output_path>/gaussians.ply           — foreground Gaussian attributes (colours, opacities,
+                                            scales, rotations)
   - <gs_model_path>/iteration_N/point_cloud.ply — background 3DGS (unchanged)
 
 No rendering is performed here. Use render_composite_4dgs.py to render from any camera.
@@ -54,13 +54,13 @@ from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_path", required=True,
-                        help="ram4d output dir (contains gaussians/ with placement.json)")
+                        help="gaussians dir (contains gaussians.ply, deformation_offsets.npy, placement.json)")
     parser.add_argument("--gs_scene_path", default=None,
                         help="Inpaint360GS scene dir (contains sparse/0/) — required unless "
                              "--placement_path JSON contains a 'rotation' key")
     parser.add_argument("--placement_path", default=None,
                         help="Override placement JSON (e.g. placement_refined.json from "
-                             "refine_frame0.py). Defaults to <output_path>/gaussians/placement.json. "
+                             "refine_frame0.py). Defaults to <output_path>/placement.json. "
                              "If the JSON contains a 'rotation' key (3×3 matrix), that rotation "
                              "is used directly and --gs_scene_path is not needed.")
     parser.add_argument("--camera_idx", type=int, default=28,
@@ -160,7 +160,7 @@ def load_fg_positions(ply_path):
 def main():
     args = parse_args()
 
-    gaussians_dir  = os.path.join(args.output_path, "gaussians")
+    gaussians_dir  = args.output_path
     placement_path = (args.placement_path
                       if args.placement_path is not None
                       else os.path.join(gaussians_dir, "placement.json"))
