@@ -1,17 +1,18 @@
 """
 mesh_to_4dgs.py — Convert dynamic ActionMesh output to 4D Gaussian Splatting.
 
-One Gaussian per mesh triangle. Uses UV-to-3D Jacobian to derive physically
-motivated scale and orientation (mesh2splat approach). Deformation offsets are
-computed per frame as centroid displacements.
+Samples Gaussians uniformly by surface area (area-weighted triangle selection +
+random barycentric coordinates). Scale and orientation are derived from the
+containing triangle's local frame (UV-to-3D Jacobian). Deformation offsets use
+barycentric interpolation of per-vertex deformations.
 
 Outputs:
   <output_dir>/gaussians.ply         — 3DGS PLY (Inpaint360GS compatible)
   <output_dir>/deformation_offsets.npy — (T, N_tri, 3) xyz offsets
 
 Usage:
-  python mesh_to_4dgs.py --input_mesh output/2026.03.03/actionmesh_gs_replace_corgi --output_dir output/2026.04.15/corgi_gaussians
-  python mesh_to_4dgs.py --input_mesh ... --output_dir ... --sigma 0.65
+  python mesh_to_4dgs.py --input_mesh output/2026.03.03/actionmesh_gs_replace_corgi --output_dir output/2026.04.16/corgi_gaussians
+  python mesh_to_4dgs.py --input_mesh ... --output_dir ... --n_gaussians 40000 --sigma 0.65
 """
 
 import sys
@@ -67,6 +68,14 @@ def parse_args():
     parser.add_argument(
         "--sigma", type=float, default=0.65,
         help="Fraction of the average 3D triangle edge length used as Gaussian scale (default: 0.65)."
+    )
+    parser.add_argument(
+        "--n_gaussians", type=int, default=40000,
+        help="Number of Gaussians to sample from the mesh surface (default: 40000)."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="Random seed for surface sampling (default: 0)."
     )
     return parser.parse_args()
 
@@ -162,58 +171,92 @@ def sample_texture_at_uvs(texture_np, uvs):
     return rgb.astype(np.float32)
 
 
-def compute_per_triangle_gaussians(mesh, texture_np, sigma):
+def sample_surface_gaussians(mesh, texture_np, sigma, n_gaussians, seed=0):
     """
-    Compute static 3DGS parameters for each triangle in frame-0 mesh.
+    Sample Gaussians uniformly by surface area from the frame-0 mesh.
 
-    Returns dict with keys: centroid, log_scale, quaternion, f_dc, opacity
+    Each Gaussian is placed at a random point inside a triangle, with triangles
+    selected proportional to their area. Barycentric coordinates are stored for
+    use in deformation offset computation.
+
+    Returns dict with keys:
+      centroid    (N, 3)  — 3D positions
+      log_scale   (N, 3)
+      quaternion  (N, 4)  — wxyz
+      f_dc        (N, 3)
+      opacity     (N, 1)
+      tri_indices (N,)    — which triangle each Gaussian belongs to
+      bary_coords (N, 3)  — barycentric weights (w0, w1, w2)
     """
-    v_pos = mesh.v_pos.cpu().numpy()      # (V_tex, 3)
+    rng = np.random.default_rng(seed)
+
+    v_pos = mesh.v_pos.cpu().numpy()          # (V, 3)
     t_pos_idx = mesh.t_pos_idx.cpu().numpy()  # (F, 3)
-    v_tex = mesh.v_tex.cpu().numpy()      # (V_uv, 2)
+    v_tex = mesh.v_tex.cpu().numpy()          # (V_uv, 2)
     t_tex_idx = mesh.t_tex_idx.cpu().numpy()  # (F, 3)
 
     F = t_pos_idx.shape[0]
     print(f"  Triangles: {F}")
 
-    # Position indices for each triangle corner
+    # Corner positions and UVs for all triangles
     idx0, idx1, idx2 = t_pos_idx[:, 0], t_pos_idx[:, 1], t_pos_idx[:, 2]
     v0, v1, v2 = v_pos[idx0], v_pos[idx1], v_pos[idx2]  # (F, 3) each
 
-    # UV indices
     uv_idx0, uv_idx1, uv_idx2 = t_tex_idx[:, 0], t_tex_idx[:, 1], t_tex_idx[:, 2]
     uv0, uv1, uv2 = v_tex[uv_idx0], v_tex[uv_idx1], v_tex[uv_idx2]  # (F, 2) each
 
-    # --- Centroid ---
-    centroid = (v0 + v1 + v2) / 3.0  # (F, 3)
-
-    # --- 3D edge vectors ---
+    # --- 3D edge vectors (used for scale, rotation, area) ---
     dp1 = v1 - v0  # (F, 3)
     dp2 = v2 - v0
 
-    # --- UV edge vectors ---
+    # --- Surface normals ---
+    normal_raw = np.cross(dp1, dp2)  # (F, 3)
+    norm_len = np.linalg.norm(normal_raw, axis=-1, keepdims=True)
+    degenerate_tri = (norm_len[:, 0] < 1e-10)
+    areas = norm_len[:, 0] / 2.0  # triangle area = |cross| / 2
+
+    # --- Area-weighted triangle sampling ---
+    areas_safe = np.maximum(areas, 0.0)
+    total_area = areas_safe.sum()
+    if total_area < 1e-12:
+        raise ValueError("Mesh has zero total surface area.")
+    probs = areas_safe / total_area
+    tri_indices = rng.choice(F, size=n_gaussians, p=probs)  # (N,)
+
+    # --- Random barycentric coordinates (uniform in triangle) ---
+    r1 = rng.random(n_gaussians).astype(np.float32)
+    r2 = rng.random(n_gaussians).astype(np.float32)
+    sqrt_r1 = np.sqrt(r1)
+    w0 = 1.0 - sqrt_r1
+    w1 = sqrt_r1 * (1.0 - r2)
+    w2 = sqrt_r1 * r2
+    bary_coords = np.stack([w0, w1, w2], axis=-1)  # (N, 3)
+
+    # --- Sampled positions ---
+    sv0 = v0[tri_indices]; sv1 = v1[tri_indices]; sv2 = v2[tri_indices]
+    centroid = w0[:, None] * sv0 + w1[:, None] * sv1 + w2[:, None] * sv2  # (N, 3)
+
+    # --- Per-triangle geometry for scale / rotation ---
+    # Each Gaussian inherits its triangle's local frame and scale.
+    sdp1 = dp1[tri_indices]  # (N, 3)
+    sdp2 = dp2[tri_indices]
+    snorm_raw = normal_raw[tri_indices]  # (N, 3)
+    snorm_len = np.maximum(norm_len[tri_indices], 1e-10)  # (N, 1)
+    normal = snorm_raw / snorm_len  # (N, 3)
+
+    # --- UV edge vectors for tangent frame ---
     duv1 = uv1 - uv0  # (F, 2)
     duv2 = uv2 - uv0
+    sduv1 = duv1[tri_indices]  # (N, 2)
+    sduv2 = duv2[tri_indices]
 
-    # --- Surface normal ---
-    normal = np.cross(dp1, dp2)  # (F, 3)
-    norm_len = np.linalg.norm(normal, axis=-1, keepdims=True)
-    degenerate_tri = (norm_len[:, 0] < 1e-10)
-    norm_len = np.maximum(norm_len, 1e-10)
-    normal = normal / norm_len  # (F, 3)
-
-    # --- UV-to-3D Jacobian: J (F, 3, 2) ---
-    # [dp1 | dp2] = J @ [[duv1.x, duv2.x], [duv1.y, duv2.y]]
-    # J = [dp1 | dp2] @ inv(D) where D = [[duv1.x, duv2.x], [duv1.y, duv2.y]]
     D = np.stack([
-        np.stack([duv1[:, 0], duv2[:, 0]], axis=-1),  # row 0: [duv1.x, duv2.x]
-        np.stack([duv1[:, 1], duv2[:, 1]], axis=-1),  # row 1: [duv1.y, duv2.y]
-    ], axis=-2)  # (F, 2, 2)
-
-    det = D[:, 0, 0] * D[:, 1, 1] - D[:, 0, 1] * D[:, 1, 0]  # (F,)
+        np.stack([sduv1[:, 0], sduv2[:, 0]], axis=-1),
+        np.stack([sduv1[:, 1], sduv2[:, 1]], axis=-1),
+    ], axis=-2)  # (N, 2, 2)
+    det = D[:, 0, 0] * D[:, 1, 1] - D[:, 0, 1] * D[:, 1, 0]
     degenerate_uv = (np.abs(det) < 1e-10)
 
-    # Invert D where non-degenerate
     D_inv = np.zeros_like(D)
     ok = ~degenerate_uv
     D_inv[ok, 0, 0] =  D[ok, 1, 1] / det[ok]
@@ -221,92 +264,85 @@ def compute_per_triangle_gaussians(mesh, texture_np, sigma):
     D_inv[ok, 1, 0] = -D[ok, 1, 0] / det[ok]
     D_inv[ok, 1, 1] =  D[ok, 0, 0] / det[ok]
 
-    # [dp1 | dp2] is (F, 3, 2) with columns dp1, dp2
-    dp_mat = np.stack([dp1, dp2], axis=-1)  # (F, 3, 2)
-    J = dp_mat @ D_inv  # (F, 3, 2)  J[:,0]=tangent, J[:,1]=bitangent in 3D space
+    dp_mat = np.stack([sdp1, sdp2], axis=-1)  # (N, 3, 2)
+    J = dp_mat @ D_inv  # (N, 3, 2)
 
-    # --- Scale from 3D edge lengths ---
-    # sigma is a fraction of the average 3D triangle edge length.
-    # Using Jacobian magnitudes (world/UV) would produce scales ~100× too large.
-    edge_len_3d = (np.linalg.norm(dp1, axis=-1) + np.linalg.norm(dp2, axis=-1)) / 2.0
-    scale_tang   = sigma * edge_len_3d
-    scale_bitang = sigma * edge_len_3d
-    scale_norm   = 0.01 * sigma * edge_len_3d
-
-    # Clamp scales to avoid log(0)
-    scale_tang = np.maximum(scale_tang, 1e-8)
-    scale_bitang = np.maximum(scale_bitang, 1e-8)
-    scale_norm = np.maximum(scale_norm, 1e-8)
+    # --- Scale from triangle edge lengths ---
+    edge_len_3d = (np.linalg.norm(sdp1, axis=-1) + np.linalg.norm(sdp2, axis=-1)) / 2.0
+    scale_tang   = np.maximum(sigma * edge_len_3d, 1e-8)
+    scale_bitang = np.maximum(sigma * edge_len_3d, 1e-8)
+    scale_norm   = np.maximum(0.01 * sigma * edge_len_3d, 1e-8)
 
     log_scale = np.stack([
         np.log(scale_tang),
         np.log(scale_bitang),
         np.log(scale_norm),
-    ], axis=-1)  # (F, 3)
+    ], axis=-1)  # (N, 3)
 
-    # --- Rotation quaternion from orthonormal frame ---
+    # --- Rotation from tangent frame ---
     tangent = J[:, :, 0].copy()
     tang_norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
-    # Fallback tangent when UV is degenerate
-    fallback_tangent = dp1 / np.maximum(np.linalg.norm(dp1, axis=-1, keepdims=True), 1e-10)
+    fallback_tangent = sdp1 / np.maximum(np.linalg.norm(sdp1, axis=-1, keepdims=True), 1e-10)
     use_fallback = (tang_norm[:, 0] < 1e-10) | degenerate_uv
     tangent = np.where(use_fallback[:, None], fallback_tangent, tangent)
-    tang_norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
-    tangent = tangent / np.maximum(tang_norm, 1e-10)
+    tangent = tangent / np.maximum(np.linalg.norm(tangent, axis=-1, keepdims=True), 1e-10)
 
-    bitangent = np.cross(normal, tangent)  # (F, 3)
+    bitangent = np.cross(normal, tangent)  # (N, 3)
     bitan_norm = np.linalg.norm(bitangent, axis=-1, keepdims=True)
-    # Handle near-parallel normal/tangent
     bad = bitan_norm[:, 0] < 1e-10
     if bad.any():
-        perp = np.zeros_like(tangent)
-        perp[:, 0] = 1.0
+        perp = np.zeros_like(tangent); perp[:, 0] = 1.0
         alt_bitan = np.cross(normal, perp)
         alt_bitan = alt_bitan / np.maximum(np.linalg.norm(alt_bitan, axis=-1, keepdims=True), 1e-10)
         bitangent[bad] = alt_bitan[bad]
         bitan_norm[bad] = np.linalg.norm(bitangent[bad], axis=-1, keepdims=True)
     bitangent = bitangent / np.maximum(bitan_norm, 1e-10)
 
-    # Rotation matrix: columns are [tangent, bitangent, normal] -> local X, Y, Z
-    rot_matrix = np.stack([tangent, bitangent, normal], axis=-1)  # (F, 3, 3)
-
+    rot_matrix = np.stack([tangent, bitangent, normal], axis=-1)  # (N, 3, 3)
     rot_t = torch.from_numpy(rot_matrix.astype(np.float32))
-    quaternion = rotation_matrix_to_quaternion(rot_t).numpy()  # (F, 4) wxyz
+    quaternion = rotation_matrix_to_quaternion(rot_t).numpy()  # (N, 4) wxyz
 
-    # --- Color: bilinear sample texture at UV centroid ---
-    uv_centroid = (uv0 + uv1 + uv2) / 3.0  # (F, 2)
-    # Clamp UVs to valid range
-    uv_centroid = np.clip(uv_centroid, 0.0, 1.0)
-    rgb = sample_texture_at_uvs(texture_np, uv_centroid)  # (F, 3)
-    f_dc = (rgb - 0.5) / C0  # SH DC coefficient, (F, 3)
+    # --- Color: interpolate UV then sample texture ---
+    suv0 = uv0[tri_indices]; suv1 = uv1[tri_indices]; suv2 = uv2[tri_indices]
+    uv_sample = w0[:, None] * suv0 + w1[:, None] * suv1 + w2[:, None] * suv2  # (N, 2)
+    uv_sample = np.clip(uv_sample, 0.0, 1.0)
+    rgb = sample_texture_at_uvs(texture_np, uv_sample)  # (N, 3)
+    f_dc = (rgb - 0.5) / C0
 
-    # --- Opacity (fully opaque): inverse sigmoid(0.99) ---
-    opacity = np.full((F, 1), np.log(0.99 / 0.01), dtype=np.float32)  # ≈ 4.595
+    # --- Opacity ---
+    opacity = np.full((n_gaussians, 1), np.log(0.99 / 0.01), dtype=np.float32)
 
-    n_degen = int(degenerate_uv.sum()) + int(degenerate_tri.sum())
+    n_degen = int(degenerate_uv.sum()) + int(degenerate_tri[tri_indices].sum())
     if n_degen > 0:
-        print(f"  Degenerate triangles: {n_degen}")
+        print(f"  Gaussians on degenerate triangles: {n_degen}")
 
     return {
-        "centroid": centroid.astype(np.float32),
-        "log_scale": log_scale.astype(np.float32),
-        "quaternion": quaternion.astype(np.float32),
-        "f_dc": f_dc.astype(np.float32),
-        "opacity": opacity,
-        "t_pos_idx": t_pos_idx,
+        "centroid":    centroid.astype(np.float32),
+        "log_scale":   log_scale.astype(np.float32),
+        "quaternion":  quaternion.astype(np.float32),
+        "f_dc":        f_dc.astype(np.float32),
+        "opacity":     opacity,
+        "tri_indices": tri_indices,       # (N,)
+        "bary_coords": bary_coords,       # (N, 3)
     }
 
 
-def compute_deformation_offsets(mesh, deformations_path, t_pos_idx, centroid_0, offset, scale):
+def compute_deformation_offsets(mesh, deformations_path, tri_indices, bary_coords, pos_0, offset, scale):
     """
-    Compute per-frame centroid displacement offsets.
+    Compute per-frame position offsets for each sampled Gaussian using barycentric interpolation.
+
+    Args:
+        tri_indices: (N,) triangle index for each Gaussian
+        bary_coords: (N, 3) barycentric weights (w0, w1, w2)
+        pos_0: (N, 3) frame-0 positions (used to compute relative offsets)
 
     Returns:
-        offsets: (T, N_tri, 3) float32 array
+        offsets: (T, N, 3) float32 array
     """
     print("  Loading deformations...")
     deformations = np.load(deformations_path)  # (T, V, 3)
     T = deformations.shape[0]
+    N = tri_indices.shape[0]
     print(f"  Deformations shape: {deformations.shape}")
 
     # Undo save_deformation coordinate transform: saved as [-z, x, y] -> restore [x, y, z]
@@ -321,33 +357,36 @@ def compute_deformation_offsets(mesh, deformations_path, t_pos_idx, centroid_0, 
             deformations_orig[i], offset, scale, front_x_to_y=True
         )
 
-    # Compute nearest-neighbour mapping: textured mesh verts -> original deformation verts
+    # Compute nearest-neighbour mapping: mesh verts -> deformation verts
     print("  Computing vertex NN mapping...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    v_tex = mesh.v_pos.to(device)                                         # (V_tex, 3)
+    v_mesh = mesh.v_pos.to(device)                                         # (V, 3)
     v_orig = torch.from_numpy(deformations_orig[0]).float().to(device)    # (V_orig, 3)
 
-    dist_matrix = torch.cdist(v_tex.unsqueeze(0), v_orig.unsqueeze(0)).squeeze(0)
+    dist_matrix = torch.cdist(v_mesh.unsqueeze(0), v_orig.unsqueeze(0)).squeeze(0)
     min_dist, mapping_idx = torch.min(dist_matrix, dim=1)
     avg_dist = torch.mean(min_dist).item()
     print(f"  NN mapping avg distance: {avg_dist:.6f}")
     if avg_dist > 1e-4:
         print("  WARNING: High avg distance — possible misalignment between mesh and deformations.")
-    mapping_idx_np = mapping_idx.cpu().numpy()  # (V_tex,)
+    mapping_idx_np = mapping_idx.cpu().numpy()  # (V,) maps mesh vert -> deformation vert
 
-    # Per-frame centroid offsets
-    idx0 = t_pos_idx[:, 0]
-    idx1 = t_pos_idx[:, 1]
-    idx2 = t_pos_idx[:, 2]
+    # Precompute per-Gaussian vertex indices in deformation array
+    t_pos_idx = mesh.t_pos_idx.cpu().numpy()  # (F, 3)
+    v0_idx = mapping_idx_np[t_pos_idx[tri_indices, 0]]  # (N,)
+    v1_idx = mapping_idx_np[t_pos_idx[tri_indices, 1]]
+    v2_idx = mapping_idx_np[t_pos_idx[tri_indices, 2]]
+    w0 = bary_coords[:, 0:1]  # (N, 1)
+    w1 = bary_coords[:, 1:2]
+    w2 = bary_coords[:, 2:3]
 
-    offsets = np.zeros((T, t_pos_idx.shape[0], 3), dtype=np.float32)
+    offsets = np.zeros((T, N, 3), dtype=np.float32)
     for t in range(T):
         def_verts = deformations_orig[t]   # (V_orig, 3)
-        def_v0 = def_verts[mapping_idx_np[idx0]]  # (F, 3)
-        def_v1 = def_verts[mapping_idx_np[idx1]]
-        def_v2 = def_verts[mapping_idx_np[idx2]]
-        centroid_t = (def_v0 + def_v1 + def_v2) / 3.0
-        offsets[t] = centroid_t - centroid_0
+        pos_t = (w0 * def_verts[v0_idx]
+               + w1 * def_verts[v1_idx]
+               + w2 * def_verts[v2_idx])   # (N, 3)
+        offsets[t] = pos_t - pos_0
 
         if t % 10 == 0:
             max_off = np.abs(offsets[t]).max()
@@ -451,11 +490,12 @@ def main():
     print(f"  UV verts: {mesh.v_tex.shape[0]}, UV faces: {mesh.t_tex_idx.shape[0]}")
     print(f"  offset: {offset}, scale: {scale:.6f}")
 
-    # --- Compute per-triangle Gaussians ---
-    print("\n--- Computing per-triangle Gaussians (frame 0) ---")
-    gaussians = compute_per_triangle_gaussians(mesh, texture_np, sigma=args.sigma)
-    N_tri = gaussians["centroid"].shape[0]
-    print(f"  N Gaussians: {N_tri}")
+    # --- Sample Gaussians uniformly by surface area ---
+    print("\n--- Sampling surface Gaussians (frame 0) ---")
+    gaussians = sample_surface_gaussians(mesh, texture_np, sigma=args.sigma,
+                                         n_gaussians=args.n_gaussians, seed=args.seed)
+    N = gaussians["centroid"].shape[0]
+    print(f"  N Gaussians: {N}")
 
     # --- Compute deformation offsets ---
     offsets = None
@@ -464,7 +504,8 @@ def main():
         offsets = compute_deformation_offsets(
             mesh,
             deformations_path,
-            gaussians["t_pos_idx"],
+            gaussians["tri_indices"],
+            gaussians["bary_coords"],
             gaussians["centroid"],
             offset,
             scale,
@@ -495,7 +536,7 @@ def main():
         print(f"  Written: {offsets_path}")
 
     print(f"\nDone.")
-    print(f"  N Gaussians (triangles): {N_tri}")
+    print(f"  N Gaussians: {N}")
     if offsets is not None:
         print(f"  Deformation offsets shape: {offsets.shape}")
 
