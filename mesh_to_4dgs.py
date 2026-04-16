@@ -267,11 +267,12 @@ def sample_surface_gaussians(mesh, texture_np, sigma, n_gaussians, seed=0):
     dp_mat = np.stack([sdp1, sdp2], axis=-1)  # (N, 3, 2)
     J = dp_mat @ D_inv  # (N, 3, 2)
 
-    # --- Scale from triangle edge lengths ---
-    edge_len_3d = (np.linalg.norm(sdp1, axis=-1) + np.linalg.norm(sdp2, axis=-1)) / 2.0
-    scale_tang   = np.maximum(sigma * edge_len_3d, 1e-8)
-    scale_bitang = np.maximum(sigma * edge_len_3d, 1e-8)
-    scale_norm   = np.maximum(0.01 * sigma * edge_len_3d, 1e-8)
+    # --- Scale from average inter-point spacing (shrinks with more Gaussians) ---
+    avg_spacing  = np.sqrt(total_area / n_gaussians)
+    scale_val    = float(np.maximum(sigma * avg_spacing, 1e-8))
+    scale_tang   = np.full(n_gaussians, scale_val,        dtype=np.float32)
+    scale_bitang = np.full(n_gaussians, scale_val,        dtype=np.float32)
+    scale_norm   = np.full(n_gaussians, 0.01 * scale_val, dtype=np.float32)
 
     log_scale = np.stack([
         np.log(scale_tang),
