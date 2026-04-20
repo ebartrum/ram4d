@@ -65,8 +65,10 @@ def parse_args():
                         help="Override path to fg_positions_world.npy")
     parser.add_argument("--render_output_dir", default=None,
                         help="Directory to save output PNGs (default: <output_path>)")
-    parser.add_argument("--render_scale", type=float, default=0.25,
-                        help="Scale factor applied to COLMAP camera resolution (default 0.25)")
+    parser.add_argument("--width",  type=int, default=832,
+                        help="Output render width in pixels (default 832)")
+    parser.add_argument("--height", type=int, default=480,
+                        help="Output render height in pixels (default 480)")
     parser.add_argument("--rendering_mode", choices=["static", "dynamic"], default="dynamic",
                         help="Render a single static frame (static) or full animation videos (dynamic, default)")
     parser.add_argument("--frame_idx", type=int, default=0,
@@ -187,9 +189,8 @@ def main():
     # --- 4 canonical orbit cameras ---
     print("\n--- Creating 4 canonical cameras ---")
     poses_w2c, FoVx, FoVy, cam_W, cam_H = create_orbit_cameras(args.gs_scene_path, n_frames=4)
-    W = max(1, int(cam_W * args.render_scale))
-    H = max(1, int(cam_H * args.render_scale))
-    print(f"  Native {cam_W}×{cam_H} → render {W}×{H}  (scale={args.render_scale})")
+    W, H = args.width, args.height
+    print(f"  Native {cam_W}×{cam_H} → render {W}×{H}")
 
     # --- Precompute per-view camera matrices ---
     cameras = [
