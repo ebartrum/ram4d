@@ -63,7 +63,7 @@ from plyfile import PlyData
 
 from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from camera_utils import load_orbit_cameras
+from camera_utils import create_orbit_cameras
 
 C0 = 0.28209479177387814
 
@@ -280,7 +280,7 @@ def main():
     # --- Camera sequence ---
     print("\n--- Loading cameras ---")
     if args.orbit:
-        poses_w2c, FoVx, FoVy, cam_W, cam_H = load_orbit_cameras(
+        poses_w2c, FoVx, FoVy, cam_W, cam_H = create_orbit_cameras(
             args.gs_scene_path, args.n_frames
         )
     else:

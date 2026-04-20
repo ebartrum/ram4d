@@ -33,7 +33,7 @@ class _SimpleCamera:
         self.T = tvec
 
 
-def load_orbit_cameras(scene_path, n_frames):
+def create_orbit_cameras(scene_path, n_frames):
     """Generate an orbit trajectory from all COLMAP cameras using generate_ellipse_path."""
     from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
     from utils.pose_utils import generate_ellipse_path
