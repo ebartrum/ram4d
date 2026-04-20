@@ -25,7 +25,9 @@ import os
 import numpy as np
 import torch
 from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
+from scene.cameras import MiniCam
 from utils.pose_utils import generate_ellipse_path
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class _SimpleCamera:
     """Minimal stub for generate_ellipse_path — needs R (C2W) and T (W2C translation)."""
@@ -73,12 +75,7 @@ def make_minicam_at_resolution(cam_info, width, height, znear=0.01, zfar=100.0):
         fovy = 2 * atan(tan(fovx/2) * height / width)
 
     cam_info must have keys: "fovx", "R" (3×3 rotation c2w), "T" (translation w2c).
-
-    Requires Inpaint360GS to be on sys.path (lazy import).
-    Replaces make_wan_minicam() in run_gs_replace.py.
     """
-    from scene.cameras import MiniCam
-    from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
     fovx = cam_info["fovx"]
     fovy = 2.0 * math.atan(math.tan(fovx / 2.0) * height / width)
