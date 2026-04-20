@@ -144,44 +144,7 @@ def load_colmap_camera(scene_path, camera_idx):
     return [pose_w2c], FoVx, FoVy, W, H
 
 
-class _SimpleCamera:
-    """Minimal stub for generate_ellipse_path — needs R (C2W) and T (W2C translation)."""
-    def __init__(self, R_c2w, tvec):
-        self.R = R_c2w
-        self.T = tvec
-
-
-def load_orbit_cameras(scene_path, n_frames):
-    """Generate an orbit trajectory from all COLMAP cameras using generate_ellipse_path."""
-    from utils.pose_utils import generate_ellipse_path
-
-    images_bin  = os.path.join(scene_path, "sparse", "0", "images.bin")
-    cameras_bin = os.path.join(scene_path, "sparse", "0", "cameras.bin")
-    extrinsics = read_extrinsics_binary(images_bin)
-    intrinsics = read_intrinsics_binary(cameras_bin)
-    sorted_images = sorted(extrinsics.values(), key=lambda x: x.name)
-
-    views = [
-        _SimpleCamera(R_c2w=qvec2rotmat(img.qvec).T,
-                      tvec=np.array(img.tvec, dtype=np.float64))
-        for img in sorted_images
-    ]
-
-    # Use camera 0's intrinsics as reference FoV
-    cam0 = intrinsics[sorted_images[0].camera_id]
-    W, H = int(cam0.width), int(cam0.height)
-    if cam0.model in ("PINHOLE", "OPENCV"):
-        fx, fy = cam0.params[0], cam0.params[1]
-    elif cam0.model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
-        fx = fy = cam0.params[0]
-    else:
-        raise ValueError(f"Unsupported COLMAP camera model: {cam0.model}")
-    FoVx = 2.0 * math.atan(W / (2.0 * fx))
-    FoVy = 2.0 * math.atan(H / (2.0 * fy))
-
-    print(f"  Generating orbit from {len(views)} training cameras → {n_frames} frames")
-    poses_w2c = generate_ellipse_path(views, n_frames=n_frames, is_circle=True)
-    return poses_w2c, FoVx, FoVy, W, H
+from camera_utils import load_orbit_cameras
 
 
 # ---------------------------------------------------------------------------
