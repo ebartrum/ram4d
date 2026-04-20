@@ -24,7 +24,8 @@ import math
 import os
 import numpy as np
 import torch
-
+from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
+from utils.pose_utils import generate_ellipse_path
 
 class _SimpleCamera:
     """Minimal stub for generate_ellipse_path — needs R (C2W) and T (W2C translation)."""
@@ -32,11 +33,8 @@ class _SimpleCamera:
         self.R = R_c2w
         self.T = tvec
 
-
 def create_orbit_cameras(scene_path, n_frames):
     """Generate an orbit trajectory from all COLMAP cameras using generate_ellipse_path."""
-    from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
-    from utils.pose_utils import generate_ellipse_path
 
     images_bin  = os.path.join(scene_path, "sparse", "0", "images.bin")
     cameras_bin = os.path.join(scene_path, "sparse", "0", "cameras.bin")
