@@ -84,6 +84,8 @@ def parse_args():
     parser.add_argument("--render_scale", type=float, default=0.25,
                         help="Scale factor applied to COLMAP camera resolution (default 0.25)")
     parser.add_argument("--fps", type=int, default=16)
+    parser.add_argument("--output_format", choices=["video", "frames"], default="video",
+                        help="Output as video (default) or individual PNG frames in a subdirectory")
     parser.add_argument("--static", action="store_true",
                         help="Freeze fg at frame 0 (static placement check, no animation)")
     parser.add_argument("--fg_only", action="store_true",
@@ -417,6 +419,13 @@ def main():
         png_path = os.path.join(render_dir, png_name)
         imageio.imwrite(png_path, frames[0])
         print(f"\nFrame: {png_path}")
+    elif args.output_format == "frames":
+        # Derive a frames subdir name from the video name (strip .mp4)
+        frames_dir = out_video[:-4] + "_frames"
+        os.makedirs(frames_dir, exist_ok=True)
+        for idx, frame in enumerate(frames):
+            imageio.imwrite(os.path.join(frames_dir, f"{idx:05d}.png"), frame)
+        print(f"\nFrames: {frames_dir}  ({len(frames)} PNGs  {W}×{H})")
     else:
         imageio.imwrite(out_frame0, frames[0])
         print(f"\nFrame 0: {out_frame0}")
