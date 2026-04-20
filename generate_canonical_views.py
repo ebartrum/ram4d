@@ -251,7 +251,7 @@ def main():
             offload_model=True,
         )
         out_path = os.path.join(render_dir, f"{name}.mp4")
-        cache_video(tensor=video, save_file=out_path, fps=args.fps, nrow=1,
+        cache_video(tensor=video.unsqueeze(0), save_file=out_path, fps=args.fps, nrow=1,
                     normalize=True, value_range=(-1, 1))
         print(f"  Saved: {out_path}")
 
