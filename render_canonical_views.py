@@ -67,8 +67,12 @@ def parse_args():
                         help="Directory to save output PNGs (default: <output_path>)")
     parser.add_argument("--render_scale", type=float, default=0.25,
                         help="Scale factor applied to COLMAP camera resolution (default 0.25)")
+    parser.add_argument("--rendering_mode", choices=["static", "dynamic"], default="dynamic",
+                        help="Render a single static frame (static) or full animation videos (dynamic, default)")
     parser.add_argument("--frame_idx", type=int, default=0,
-                        help="Foreground animation frame to render (default 0)")
+                        help="Foreground animation frame to render in static mode (default 0)")
+    parser.add_argument("--fps", type=int, default=16,
+                        help="Frames per second for dynamic video output (default 16)")
     return parser.parse_args()
 
 
@@ -146,9 +150,6 @@ def main():
     T_fg, N_fg, _ = fg_positions_world.shape
     print(f"  Shape: {fg_positions_world.shape}")
 
-    t_fg = args.frame_idx % T_fg
-    print(f"  Using fg frame {t_fg}")
-
     # --- Foreground attributes ---
     print("\n--- Loading foreground Gaussian attributes ---")
     _, f_dc_fg, op_fg, log_sc_fg, rot_fg = load_ply_gs(fg_ply_path)
@@ -175,9 +176,7 @@ def main():
     alpha_t  = torch.from_numpy(1.0 / (1.0 + np.exp(-op_all))).float().to(device).unsqueeze(1)
     scales_t = torch.from_numpy(scales_all).float().to(device)
     rot_t    = torch.from_numpy(rot_all).float().to(device)
-    fg_pos_t = torch.from_numpy(fg_positions_world[t_fg]).float().to(device)
-    means3D  = torch.cat([xyz_bg_t, fg_pos_t], dim=0)
-    print(f"  Total Gaussians: {means3D.shape[0]:,}  (bg={len(xyz_bg):,}  fg={N_fg:,})")
+    print(f"  Gaussians: bg={len(xyz_bg):,}  fg={N_fg:,}")
 
     # --- 4 canonical orbit cameras ---
     print("\n--- Creating 4 canonical cameras ---")
@@ -186,19 +185,41 @@ def main():
     H = max(1, int(cam_H * args.render_scale))
     print(f"  Native {cam_W}×{cam_H} → render {W}×{H}  (scale={args.render_scale})")
 
+    # --- Precompute per-view camera matrices ---
+    cameras = [
+        make_raster_camera_at_resolution(poses_w2c[i], FoVx, W, H, device)
+        for i in range(4)
+    ]
+
     # --- Render and save ---
-    print(f"\n--- Rendering 4 views ---")
-    for i, name in enumerate(VIEW_NAMES):
-        viewmat, full_proj, campos, tanfovx, tanfovy = make_raster_camera_at_resolution(
-            poses_w2c[i], FoVx, W, H, device
-        )
-        img = render_frame(
-            means3D, rgb_t, alpha_t, scales_t, rot_t,
-            viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
-        )
-        out_path = os.path.join(render_dir, f"{name}.png")
-        imageio.imwrite(out_path, img)
-        print(f"  {name}: {out_path}")
+    if args.rendering_mode == "static":
+        t_fg = args.frame_idx % T_fg
+        print(f"\n--- Rendering 4 static views (fg frame {t_fg}) ---")
+        fg_pos_t = torch.from_numpy(fg_positions_world[t_fg]).float().to(device)
+        means3D  = torch.cat([xyz_bg_t, fg_pos_t], dim=0)
+        for (viewmat, full_proj, campos, tanfovx, tanfovy), name in zip(cameras, VIEW_NAMES):
+            img = render_frame(
+                means3D, rgb_t, alpha_t, scales_t, rot_t,
+                viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
+            )
+            out_path = os.path.join(render_dir, f"{name}.png")
+            imageio.imwrite(out_path, img)
+            print(f"  {name}: {out_path}")
+    else:
+        print(f"\n--- Rendering 4 dynamic views ({T_fg} frames each @ {args.fps} fps) ---")
+        for (viewmat, full_proj, campos, tanfovx, tanfovy), name in zip(cameras, VIEW_NAMES):
+            frames = []
+            for t in range(T_fg):
+                fg_pos_t = torch.from_numpy(fg_positions_world[t]).float().to(device)
+                means3D  = torch.cat([xyz_bg_t, fg_pos_t], dim=0)
+                img = render_frame(
+                    means3D, rgb_t, alpha_t, scales_t, rot_t,
+                    viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
+                )
+                frames.append(img)
+            out_path = os.path.join(render_dir, f"{name}.mp4")
+            imageio.mimsave(out_path, frames, fps=args.fps)
+            print(f"  {name}: {out_path}")
 
 
 if __name__ == "__main__":
