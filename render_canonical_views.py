@@ -48,7 +48,7 @@ from camera_utils import create_orbit_cameras, make_raster_camera_at_resolution
 
 C0 = 0.28209479177387814
 
-VIEW_NAMES = ["left", "back", "right", "front"]
+VIEW_NAMES = ["right", "back", "left", "front"]
 
 
 def parse_args():
