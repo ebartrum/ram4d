@@ -254,6 +254,9 @@ def parse_args():
                         help="Inpaint360GS model dir (iteration_N/point_cloud.ply)")
     parser.add_argument("--camera_idx", type=int, default=28,
                         help="COLMAP camera index for source view (default 28)")
+    parser.add_argument("--fg_ply_path", default=None,
+                        help="Override path to gaussians.ply "
+                             "(default: composite_path/gaussians/gaussians.ply)")
     parser.add_argument("--fg_positions_world_path", default=None,
                         help="Path to fg_positions_world.npy from create_composite_4dgs.py "
                              "(default: composite_path/gaussians/fg_positions_world.npy)")
@@ -435,7 +438,7 @@ def main():
     gaussians_dir     = os.path.join(args.composite_path, "gaussians")
     frames_dir        = args.frames_dir or os.path.join(args.composite_path, "frames")
     masks_dir         = args.masks_dir  or os.path.join(args.composite_path, "sam2_masks")
-    fg_ply_path       = os.path.join(gaussians_dir, "gaussians.ply")
+    fg_ply_path       = args.fg_ply_path or os.path.join(gaussians_dir, "gaussians.ply")
     fg_pos_world_path = args.fg_positions_world_path or os.path.join(
         gaussians_dir, "fg_positions_world.npy"
     )
