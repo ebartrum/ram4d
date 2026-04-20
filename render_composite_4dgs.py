@@ -63,9 +63,9 @@ from plyfile import PlyData
 
 from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from camera_utils import load_orbit_cameras
 
 C0 = 0.28209479177387814
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -143,10 +143,6 @@ def load_colmap_camera(scene_path, camera_idx):
     pose_w2c[:3,  3] = tvec
     return [pose_w2c], FoVx, FoVy, W, H
 
-
-from camera_utils import load_orbit_cameras
-
-
 # ---------------------------------------------------------------------------
 # PLY loading
 # ---------------------------------------------------------------------------
@@ -163,7 +159,6 @@ def find_latest_ply(model_path):
         raise FileNotFoundError(f"PLY not found: {ply}")
     return ply
 
-
 def load_ply_gs(ply_path):
     v = PlyData.read(ply_path).elements[0]
     xyz     = np.stack([v['x'],       v['y'],       v['z']      ], axis=1).astype(np.float32)
@@ -172,7 +167,6 @@ def load_ply_gs(ply_path):
     log_sc  = np.stack([v['scale_0'], v['scale_1'], v['scale_2']], axis=1).astype(np.float32)
     rot     = np.stack([v['rot_0'],   v['rot_1'],   v['rot_2'],   v['rot_3']], axis=1).astype(np.float32)
     return xyz, f_dc, opacity, log_sc, rot
-
 
 # ---------------------------------------------------------------------------
 # Camera matrices
@@ -203,7 +197,6 @@ def make_raster_camera(pose_w2c, FoVx, FoVy, W, H, device, znear=0.01, zfar=200.
     full_proj  = (viewmatrix.unsqueeze(0).bmm(proj_t.unsqueeze(0))).squeeze(0)
     campos     = torch.tensor(-(R_c2w @ t), dtype=torch.float32, device=device)
     return viewmatrix, full_proj, campos, tanfovx, tanfovy
-
 
 # ---------------------------------------------------------------------------
 # Rendering
@@ -243,7 +236,6 @@ def render_frame(means3D, colors, opacities, scales, rotations,
     )
     img = rendered.clamp(0.0, 1.0).permute(1, 2, 0)
     return (img.cpu().numpy() * 255).astype(np.uint8)
-
 
 # ---------------------------------------------------------------------------
 # Main
