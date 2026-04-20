@@ -34,10 +34,8 @@ ActionMesh normalises object size across frames, so later frames where the objec
 is physically closer to the camera will appear the wrong scale without per-frame s.
 Each frame's log_delta_s is warm-started from the previous frame's solution.
 
-Outputs saved to composite_path/gaussians/:
-  fg_positions_world_sequential.npy  (T, N_fg, 3)
-
 Outputs saved to output_path/:
+  fg_positions_world_sequential.npy  (T, N_fg, 3)
   delta_t_sequential.npy  (T, 3)
   delta_q_sequential.npy  (T, 4)
   delta_s_sequential.npy  (T,)   — per-frame scale multiplier (exp of optimised log_delta_s)
@@ -885,7 +883,7 @@ def main():
             ds = torch.tensor(delta_s_arr[t], device=device)
             dynamic_positions[t] = apply_rigid_frame(fg_pos_world_t[t], dq, dt, ds).cpu().numpy()
 
-    seq_path = os.path.join(gaussians_dir, "fg_positions_world_sequential.npy")
+    seq_path = os.path.join(args.output_path, "fg_positions_world_sequential.npy")
     np.save(seq_path, dynamic_positions)
     print(f"  Saved: {seq_path}  shape {dynamic_positions.shape}")
 
