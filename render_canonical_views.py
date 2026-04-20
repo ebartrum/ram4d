@@ -170,13 +170,19 @@ def main():
     rot_all    = np.concatenate([rot_bg,   rot_fg  ], axis=0)
     scales_all = np.concatenate([np.exp(log_sc_bg), scales_fg], axis=0)
 
-    # --- GPU attribute tensors ---
+    # --- GPU attribute tensors (composite) ---
     print("\n--- Building GPU tensors ---")
     rgb_t    = torch.from_numpy(np.clip(f_dc_all * C0 + 0.5, 0.0, 1.0)).float().to(device)
     alpha_t  = torch.from_numpy(1.0 / (1.0 + np.exp(-op_all))).float().to(device).unsqueeze(1)
     scales_t = torch.from_numpy(scales_all).float().to(device)
     rot_t    = torch.from_numpy(rot_all).float().to(device)
     print(f"  Gaussians: bg={len(xyz_bg):,}  fg={N_fg:,}")
+
+    # --- fg-only tensors for alpha matte (white colors, fg opacities) ---
+    alpha_fg_t  = torch.from_numpy(1.0 / (1.0 + np.exp(-op_fg))).float().to(device).unsqueeze(1)
+    white_fg_t  = torch.ones(N_fg, 3, device=device, dtype=torch.float32)
+    scales_fg_t = torch.from_numpy(scales_fg).float().to(device)
+    rot_fg_t    = torch.from_numpy(rot_fg).float().to(device)
 
     # --- 4 canonical orbit cameras ---
     print("\n--- Creating 4 canonical cameras ---")
@@ -202,24 +208,31 @@ def main():
                 means3D, rgb_t, alpha_t, scales_t, rot_t,
                 viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
             )
-            out_path = os.path.join(render_dir, f"{name}.png")
-            imageio.imwrite(out_path, img)
-            print(f"  {name}: {out_path}")
+            alpha_img = render_frame(
+                fg_pos_t, white_fg_t, alpha_fg_t, scales_fg_t, rot_fg_t,
+                viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
+            )
+            imageio.imwrite(os.path.join(render_dir, f"{name}.png"), img)
+            imageio.imwrite(os.path.join(render_dir, f"{name}_alpha.png"), alpha_img)
+            print(f"  {name}: {name}.png  {name}_alpha.png")
     else:
         print(f"\n--- Rendering 4 dynamic views ({T_fg} frames each @ {args.fps} fps) ---")
         for (viewmat, full_proj, campos, tanfovx, tanfovy), name in zip(cameras, VIEW_NAMES):
-            frames = []
+            frames, alpha_frames = [], []
             for t in range(T_fg):
                 fg_pos_t = torch.from_numpy(fg_positions_world[t]).float().to(device)
                 means3D  = torch.cat([xyz_bg_t, fg_pos_t], dim=0)
-                img = render_frame(
+                frames.append(render_frame(
                     means3D, rgb_t, alpha_t, scales_t, rot_t,
                     viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
-                )
-                frames.append(img)
-            out_path = os.path.join(render_dir, f"{name}.mp4")
-            imageio.mimsave(out_path, frames, fps=args.fps)
-            print(f"  {name}: {out_path}")
+                ))
+                alpha_frames.append(render_frame(
+                    fg_pos_t, white_fg_t, alpha_fg_t, scales_fg_t, rot_fg_t,
+                    viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
+                ))
+            imageio.mimsave(os.path.join(render_dir, f"{name}.mp4"), frames, fps=args.fps)
+            imageio.mimsave(os.path.join(render_dir, f"{name}_alpha.mp4"), alpha_frames, fps=args.fps)
+            print(f"  {name}: {name}.mp4  {name}_alpha.mp4")
 
 
 if __name__ == "__main__":
