@@ -63,9 +63,9 @@ from plyfile import PlyData
 
 from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from camera_utils import create_orbit_cameras
 
 C0 = 0.28209479177387814
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -84,6 +84,8 @@ def parse_args():
     parser.add_argument("--render_scale", type=float, default=0.25,
                         help="Scale factor applied to COLMAP camera resolution (default 0.25)")
     parser.add_argument("--fps", type=int, default=16)
+    parser.add_argument("--output_format", choices=["video", "frames"], default="video",
+                        help="Output as video (default) or individual PNG frames in a subdirectory")
     parser.add_argument("--static", action="store_true",
                         help="Freeze fg at frame 0 (static placement check, no animation)")
     parser.add_argument("--fg_only", action="store_true",
@@ -141,47 +143,6 @@ def load_colmap_camera(scene_path, camera_idx):
     pose_w2c[:3,  3] = tvec
     return [pose_w2c], FoVx, FoVy, W, H
 
-
-class _SimpleCamera:
-    """Minimal stub for generate_ellipse_path — needs R (C2W) and T (W2C translation)."""
-    def __init__(self, R_c2w, tvec):
-        self.R = R_c2w
-        self.T = tvec
-
-
-def load_orbit_cameras(scene_path, n_frames):
-    """Generate an orbit trajectory from all COLMAP cameras using generate_ellipse_path."""
-    from utils.pose_utils import generate_ellipse_path
-
-    images_bin  = os.path.join(scene_path, "sparse", "0", "images.bin")
-    cameras_bin = os.path.join(scene_path, "sparse", "0", "cameras.bin")
-    extrinsics = read_extrinsics_binary(images_bin)
-    intrinsics = read_intrinsics_binary(cameras_bin)
-    sorted_images = sorted(extrinsics.values(), key=lambda x: x.name)
-
-    views = [
-        _SimpleCamera(R_c2w=qvec2rotmat(img.qvec).T,
-                      tvec=np.array(img.tvec, dtype=np.float64))
-        for img in sorted_images
-    ]
-
-    # Use camera 0's intrinsics as reference FoV
-    cam0 = intrinsics[sorted_images[0].camera_id]
-    W, H = int(cam0.width), int(cam0.height)
-    if cam0.model in ("PINHOLE", "OPENCV"):
-        fx, fy = cam0.params[0], cam0.params[1]
-    elif cam0.model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
-        fx = fy = cam0.params[0]
-    else:
-        raise ValueError(f"Unsupported COLMAP camera model: {cam0.model}")
-    FoVx = 2.0 * math.atan(W / (2.0 * fx))
-    FoVy = 2.0 * math.atan(H / (2.0 * fy))
-
-    print(f"  Generating orbit from {len(views)} training cameras → {n_frames} frames")
-    poses_w2c = generate_ellipse_path(views, n_frames=n_frames, is_circle=True)
-    return poses_w2c, FoVx, FoVy, W, H
-
-
 # ---------------------------------------------------------------------------
 # PLY loading
 # ---------------------------------------------------------------------------
@@ -198,7 +159,6 @@ def find_latest_ply(model_path):
         raise FileNotFoundError(f"PLY not found: {ply}")
     return ply
 
-
 def load_ply_gs(ply_path):
     v = PlyData.read(ply_path).elements[0]
     xyz     = np.stack([v['x'],       v['y'],       v['z']      ], axis=1).astype(np.float32)
@@ -207,7 +167,6 @@ def load_ply_gs(ply_path):
     log_sc  = np.stack([v['scale_0'], v['scale_1'], v['scale_2']], axis=1).astype(np.float32)
     rot     = np.stack([v['rot_0'],   v['rot_1'],   v['rot_2'],   v['rot_3']], axis=1).astype(np.float32)
     return xyz, f_dc, opacity, log_sc, rot
-
 
 # ---------------------------------------------------------------------------
 # Camera matrices
@@ -238,7 +197,6 @@ def make_raster_camera(pose_w2c, FoVx, FoVy, W, H, device, znear=0.01, zfar=200.
     full_proj  = (viewmatrix.unsqueeze(0).bmm(proj_t.unsqueeze(0))).squeeze(0)
     campos     = torch.tensor(-(R_c2w @ t), dtype=torch.float32, device=device)
     return viewmatrix, full_proj, campos, tanfovx, tanfovy
-
 
 # ---------------------------------------------------------------------------
 # Rendering
@@ -278,7 +236,6 @@ def render_frame(means3D, colors, opacities, scales, rotations,
     )
     img = rendered.clamp(0.0, 1.0).permute(1, 2, 0)
     return (img.cpu().numpy() * 255).astype(np.uint8)
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -323,7 +280,7 @@ def main():
     # --- Camera sequence ---
     print("\n--- Loading cameras ---")
     if args.orbit:
-        poses_w2c, FoVx, FoVy, cam_W, cam_H = load_orbit_cameras(
+        poses_w2c, FoVx, FoVy, cam_W, cam_H = create_orbit_cameras(
             args.gs_scene_path, args.n_frames
         )
     else:
@@ -417,6 +374,13 @@ def main():
         png_path = os.path.join(render_dir, png_name)
         imageio.imwrite(png_path, frames[0])
         print(f"\nFrame: {png_path}")
+    elif args.output_format == "frames":
+        # Derive a frames subdir name from the video name (strip .mp4)
+        frames_dir = out_video[:-4] + "_frames"
+        os.makedirs(frames_dir, exist_ok=True)
+        for idx, frame in enumerate(frames):
+            imageio.imwrite(os.path.join(frames_dir, f"{idx:05d}.png"), frame)
+        print(f"\nFrames: {frames_dir}  ({len(frames)} PNGs  {W}×{H})")
     else:
         imageio.imwrite(out_frame0, frames[0])
         print(f"\nFrame 0: {out_frame0}")

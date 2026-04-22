@@ -21,8 +21,50 @@ Core function: make_raster_camera_at_resolution()
 """
 
 import math
+import os
 import numpy as np
 import torch
+from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
+from scene.cameras import MiniCam
+from utils.pose_utils import generate_ellipse_path
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+
+class _SimpleCamera:
+    """Minimal stub for generate_ellipse_path — needs R (C2W) and T (W2C translation)."""
+    def __init__(self, R_c2w, tvec):
+        self.R = R_c2w
+        self.T = tvec
+
+def create_orbit_cameras(scene_path, n_frames):
+    """Generate an orbit trajectory from all COLMAP cameras using generate_ellipse_path."""
+
+    images_bin  = os.path.join(scene_path, "sparse", "0", "images.bin")
+    cameras_bin = os.path.join(scene_path, "sparse", "0", "cameras.bin")
+    extrinsics = read_extrinsics_binary(images_bin)
+    intrinsics = read_intrinsics_binary(cameras_bin)
+    sorted_images = sorted(extrinsics.values(), key=lambda x: x.name)
+
+    views = [
+        _SimpleCamera(R_c2w=qvec2rotmat(img.qvec).T,
+                      tvec=np.array(img.tvec, dtype=np.float64))
+        for img in sorted_images
+    ]
+
+    # Use camera 0's intrinsics as reference FoV
+    cam0 = intrinsics[sorted_images[0].camera_id]
+    W, H = int(cam0.width), int(cam0.height)
+    if cam0.model in ("PINHOLE", "OPENCV"):
+        fx, fy = cam0.params[0], cam0.params[1]
+    elif cam0.model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
+        fx = fy = cam0.params[0]
+    else:
+        raise ValueError(f"Unsupported COLMAP camera model: {cam0.model}")
+    FoVx = 2.0 * math.atan(W / (2.0 * fx))
+    FoVy = 2.0 * math.atan(H / (2.0 * fy))
+
+    print(f"  Generating orbit from {len(views)} training cameras → {n_frames} frames")
+    poses_w2c = generate_ellipse_path(views, n_frames=n_frames, is_circle=True)
+    return poses_w2c, FoVx, FoVy, W, H
 
 
 def make_minicam_at_resolution(cam_info, width, height, znear=0.01, zfar=100.0):
@@ -33,12 +75,7 @@ def make_minicam_at_resolution(cam_info, width, height, znear=0.01, zfar=100.0):
         fovy = 2 * atan(tan(fovx/2) * height / width)
 
     cam_info must have keys: "fovx", "R" (3×3 rotation c2w), "T" (translation w2c).
-
-    Requires Inpaint360GS to be on sys.path (lazy import).
-    Replaces make_wan_minicam() in run_gs_replace.py.
     """
-    from scene.cameras import MiniCam
-    from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
     fovx = cam_info["fovx"]
     fovy = 2.0 * math.atan(math.tan(fovx / 2.0) * height / width)

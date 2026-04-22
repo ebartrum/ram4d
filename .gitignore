@@ -3,3 +3,5 @@ output
 checkpoints
 pretrained_weights
 *.sh
+.claude
+__pycache__

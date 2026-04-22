@@ -34,10 +34,8 @@ ActionMesh normalises object size across frames, so later frames where the objec
 is physically closer to the camera will appear the wrong scale without per-frame s.
 Each frame's log_delta_s is warm-started from the previous frame's solution.
 
-Outputs saved to composite_path/gaussians/:
-  fg_positions_world_sequential.npy  (T, N_fg, 3)
-
 Outputs saved to output_path/:
+  fg_positions_world_sequential.npy  (T, N_fg, 3)
   delta_t_sequential.npy  (T, 3)
   delta_q_sequential.npy  (T, 4)
   delta_s_sequential.npy  (T,)   — per-frame scale multiplier (exp of optimised log_delta_s)
@@ -254,6 +252,9 @@ def parse_args():
                         help="Inpaint360GS model dir (iteration_N/point_cloud.ply)")
     parser.add_argument("--camera_idx", type=int, default=28,
                         help="COLMAP camera index for source view (default 28)")
+    parser.add_argument("--fg_ply_path", default=None,
+                        help="Override path to gaussians.ply "
+                             "(default: composite_path/gaussians/gaussians.ply)")
     parser.add_argument("--fg_positions_world_path", default=None,
                         help="Path to fg_positions_world.npy from create_composite_4dgs.py "
                              "(default: composite_path/gaussians/fg_positions_world.npy)")
@@ -435,7 +436,7 @@ def main():
     gaussians_dir     = os.path.join(args.composite_path, "gaussians")
     frames_dir        = args.frames_dir or os.path.join(args.composite_path, "frames")
     masks_dir         = args.masks_dir  or os.path.join(args.composite_path, "sam2_masks")
-    fg_ply_path       = os.path.join(gaussians_dir, "gaussians.ply")
+    fg_ply_path       = args.fg_ply_path or os.path.join(gaussians_dir, "gaussians.ply")
     fg_pos_world_path = args.fg_positions_world_path or os.path.join(
         gaussians_dir, "fg_positions_world.npy"
     )
@@ -882,7 +883,7 @@ def main():
             ds = torch.tensor(delta_s_arr[t], device=device)
             dynamic_positions[t] = apply_rigid_frame(fg_pos_world_t[t], dq, dt, ds).cpu().numpy()
 
-    seq_path = os.path.join(gaussians_dir, "fg_positions_world_sequential.npy")
+    seq_path = os.path.join(args.output_path, "fg_positions_world_sequential.npy")
     np.save(seq_path, dynamic_positions)
     print(f"  Saved: {seq_path}  shape {dynamic_positions.shape}")
 
