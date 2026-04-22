@@ -59,6 +59,7 @@ import json
 import numpy as np
 import torch
 import imageio
+import matplotlib.cm as cm
 from plyfile import PlyData
 
 from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary, qvec2rotmat
@@ -101,6 +102,8 @@ def parse_args():
                              "(default: <output_path>/gaussians/)")
     parser.add_argument("--frame_idx", type=int, default=None,
                         help="If set, render only this animation frame and save as PNG (no video).")
+    parser.add_argument("--fg_texture", choices=["rgb", "depth"], default="rgb",
+                        help="Foreground texture: rgb (default) or depth (jet rainbow by camera-space depth)")
     return parser.parse_args()
 
 
@@ -237,6 +240,20 @@ def render_frame(means3D, colors, opacities, scales, rotations,
     img = rendered.clamp(0.0, 1.0).permute(1, 2, 0)
     return (img.cpu().numpy() * 255).astype(np.uint8)
 
+def depth_to_rainbow(fg_pos_world, viewmat, device):
+    """Colour each fg Gaussian by camera-space depth using the jet colormap."""
+    W2C = viewmat.T
+    N = fg_pos_world.shape[0]
+    ones = torch.ones(N, 1, device=device, dtype=torch.float32)
+    hom = torch.cat([fg_pos_world, ones], dim=1)
+    cam_z = (hom @ W2C.T)[:, 2]
+    z_min, z_max = cam_z.min(), cam_z.max()
+    t = (cam_z - z_min) / (z_max - z_min + 1e-8)
+    t_jet = 1.0 - t                                    # near=red, far=blue
+    colors = cm.jet(t_jet.cpu().numpy())[:, :3].astype(np.float32)
+    return torch.from_numpy(colors).float().to(device)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -253,9 +270,10 @@ def main():
     render_dir = args.render_output_dir or gaussians_dir
     os.makedirs(render_dir, exist_ok=True)
 
-    static_suffix  = "_static"  if args.static  else ""
-    fg_only_suffix = "_fg_only" if args.fg_only else ""
-    suffix = static_suffix + fg_only_suffix
+    static_suffix   = "_static"  if args.static           else ""
+    fg_only_suffix  = "_fg_only" if args.fg_only           else ""
+    texture_suffix  = "_depth"   if args.fg_texture == "depth" else ""
+    suffix = static_suffix + fg_only_suffix + texture_suffix
     if args.orbit:
         out_video  = os.path.join(render_dir, f"orbit_{args.n_frames}frames{suffix}.mp4")
         out_frame0 = os.path.join(render_dir, f"orbit_{args.n_frames}frames{suffix}_frame0.png")
@@ -306,6 +324,7 @@ def main():
         xyz_bg, f_dc_bg, op_bg, log_sc_bg, rot_bg = load_ply_gs(bg_ply)
         print(f"  {len(xyz_bg):,} Gaussians")
         xyz_bg_t   = torch.from_numpy(xyz_bg).float().to(device)
+        bg_rgb_t   = torch.from_numpy(np.clip(f_dc_bg * C0 + 0.5, 0.0, 1.0)).float().to(device)
         f_dc_all   = np.concatenate([f_dc_bg,  f_dc_fg ], axis=0)
         op_all     = np.concatenate([op_bg,    op_fg   ], axis=0)
         rot_all    = np.concatenate([rot_bg,   rot_fg  ], axis=0)
@@ -354,9 +373,15 @@ def main():
         fg_pos_t = torch.from_numpy(fg_positions_world[t_fg]).float().to(device)
         means3D  = fg_pos_t if args.fg_only else torch.cat([xyz_bg_t, fg_pos_t], dim=0)
 
+        if args.fg_texture == "depth":
+            fg_rainbow = depth_to_rainbow(fg_pos_t, viewmat, device)
+            rgb_render = fg_rainbow if args.fg_only else torch.cat([bg_rgb_t, fg_rainbow], dim=0)
+        else:
+            rgb_render = rgb_t
+
         bg_color = torch.ones(3, device=device, dtype=torch.float32) if args.fg_only else None
         img = render_frame(
-            means3D, rgb_t, alpha_t, scales_t, rot_t,
+            means3D, rgb_render, alpha_t, scales_t, rot_t,
             viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device, bg_color=bg_color,
         )
         frames.append(img)
