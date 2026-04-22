@@ -63,6 +63,7 @@ import cv2
 sys.path.insert(0, os.path.abspath("official_wan_repo"))
 
 import wan
+from taehv import WanCompatibleTAEHV
 from wan.configs import WAN_CONFIGS
 from wan.utils.utils import cache_video
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
@@ -143,6 +144,9 @@ def main():
                         help="WanI2V 14B checkpoint dir (auto-downloads if None)")
     parser.add_argument("--mask_dilation",   type=int,   default=15,
                         help="Spatial mask dilation (pixels) before latent downsampling")
+    parser.add_argument("--preview_interval", type=int,  default=0,
+                        help="Save a TAEHV preview video every N denoising steps (0=disabled). "
+                             "Requires checkpoints/taew2_1.pth.")
     args = parser.parse_args()
 
     out_dir = os.path.dirname(os.path.abspath(args.output_path))
@@ -313,6 +317,22 @@ def main():
     wan_i2v.model = wan_i2v.model.to(torch.bfloat16).to(device)
 
     # ------------------------------------------------------------------
+    # Optional: TAEHV fast decoder for step previews
+    # ------------------------------------------------------------------
+    taehv = None
+    if args.preview_interval > 0:
+        taehv_ckpt = "checkpoints/taew2_1.pth"
+        if os.path.exists(taehv_ckpt):
+            print(f"Loading TAEHV for previews from {taehv_ckpt}")
+            taehv = WanCompatibleTAEHV(checkpoint_path=taehv_ckpt).to(device).eval()
+        else:
+            print(f"WARNING: --preview_interval set but {taehv_ckpt} not found; previews disabled.")
+
+    preview_dir = os.path.join(out_dir, "previews")
+    if taehv is not None:
+        os.makedirs(preview_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------
     # 5. Denoising loop — LanPaint IS_FLOW=True
     # ------------------------------------------------------------------
     print(f"\nStarting denoising: {args.sampling_steps} steps, "
@@ -408,6 +428,16 @@ def main():
                 bg_noisy = y_latents  # final step: use clean render for bg
 
             latent = fg_mask * latent_new + (1.0 - fg_mask) * bg_noisy
+
+            # ---- Optional preview using x0_final via TAEHV ----
+            if taehv is not None and (i + 1) % args.preview_interval == 0:
+                with torch.no_grad():
+                    preview_frames = taehv.decode([x0_final.float()])[0]  # [3, T, H, W] in [-1,1]
+                cache_video(
+                    tensor=preview_frames[None],
+                    save_file=os.path.join(preview_dir, f"step_{i+1:03d}.mp4"),
+                    fps=16, nrow=1, normalize=True, value_range=(-1, 1),
+                )
 
     # ------------------------------------------------------------------
     # 6. Decode and save
