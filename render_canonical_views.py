@@ -41,6 +41,7 @@ import json
 import numpy as np
 import torch
 import imageio
+import matplotlib.cm as cm
 from plyfile import PlyData
 
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -75,6 +76,8 @@ def parse_args():
                         help="Foreground animation frame to render in static mode (default 0)")
     parser.add_argument("--fps", type=int, default=16,
                         help="Frames per second for dynamic video output (default 16)")
+    parser.add_argument("--fg_texture", choices=["rgb", "depth"], default="rgb",
+                        help="Foreground texture: rgb (default) or depth (jet rainbow by camera-space depth)")
     return parser.parse_args()
 
 
@@ -135,6 +138,25 @@ def render_frame(means3D, colors, opacities, scales, rotations,
     return (img.cpu().numpy() * 255).astype(np.uint8)
 
 
+def depth_to_rainbow(fg_pos_world, viewmat, device):
+    """Colour each fg Gaussian by camera-space depth using the jet colormap.
+
+    fg_pos_world : (N, 3) world-space positions, float32 tensor on device
+    viewmat      : (4, 4) column-major W2C (viewmat = W2C.T), float32 tensor on device
+    Returns      : (N, 3) RGB float32 tensor on device, values in [0, 1]
+    """
+    W2C = viewmat.T                                                    # (4,4)
+    N = fg_pos_world.shape[0]
+    ones = torch.ones(N, 1, device=device, dtype=torch.float32)
+    hom = torch.cat([fg_pos_world, ones], dim=1)                       # (N,4)
+    cam_z = (hom @ W2C.T)[:, 2]                                        # camera-space Z
+    z_min, z_max = cam_z.min(), cam_z.max()
+    t = (cam_z - z_min) / (z_max - z_min + 1e-8)                      # [0,1], 0=near
+    t_jet = 1.0 - t                                                    # jet: 0=blue(far) 1=red(near)
+    colors = cm.jet(t_jet.cpu().numpy())[:, :3].astype(np.float32)
+    return torch.from_numpy(colors).float().to(device)
+
+
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -175,6 +197,7 @@ def main():
     # --- GPU attribute tensors (composite) ---
     print("\n--- Building GPU tensors ---")
     rgb_t    = torch.from_numpy(np.clip(f_dc_all * C0 + 0.5, 0.0, 1.0)).float().to(device)
+    bg_rgb_t = torch.from_numpy(np.clip(f_dc_bg  * C0 + 0.5, 0.0, 1.0)).float().to(device)
     alpha_t  = torch.from_numpy(1.0 / (1.0 + np.exp(-op_all))).float().to(device).unsqueeze(1)
     scales_t = torch.from_numpy(scales_all).float().to(device)
     rot_t    = torch.from_numpy(rot_all).float().to(device)
@@ -201,12 +224,17 @@ def main():
     # --- Render and save ---
     if args.rendering_mode == "static":
         t_fg = args.frame_idx % T_fg
-        print(f"\n--- Rendering 4 static views (fg frame {t_fg}) ---")
+        print(f"\n--- Rendering 4 static views (fg frame {t_fg}, fg_texture={args.fg_texture}) ---")
         fg_pos_t = torch.from_numpy(fg_positions_world[t_fg]).float().to(device)
         means3D  = torch.cat([xyz_bg_t, fg_pos_t], dim=0)
         for (viewmat, full_proj, campos, tanfovx, tanfovy), name in zip(cameras, VIEW_NAMES):
+            if args.fg_texture == "depth":
+                fg_rainbow = depth_to_rainbow(fg_pos_t, viewmat, device)
+                rgb_render = torch.cat([bg_rgb_t, fg_rainbow], dim=0)
+            else:
+                rgb_render = rgb_t
             img = render_frame(
-                means3D, rgb_t, alpha_t, scales_t, rot_t,
+                means3D, rgb_render, alpha_t, scales_t, rot_t,
                 viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
             )
             alpha_img = render_frame(
@@ -217,14 +245,19 @@ def main():
             imageio.imwrite(os.path.join(render_dir, f"{name}_alpha.png"), alpha_img)
             print(f"  {name}: {name}.png  {name}_alpha.png")
     else:
-        print(f"\n--- Rendering 4 dynamic views ({T_fg} frames each @ {args.fps} fps) ---")
+        print(f"\n--- Rendering 4 dynamic views ({T_fg} frames each @ {args.fps} fps, fg_texture={args.fg_texture}) ---")
         for (viewmat, full_proj, campos, tanfovx, tanfovy), name in zip(cameras, VIEW_NAMES):
             frames, alpha_frames = [], []
             for t in range(T_fg):
                 fg_pos_t = torch.from_numpy(fg_positions_world[t]).float().to(device)
                 means3D  = torch.cat([xyz_bg_t, fg_pos_t], dim=0)
+                if args.fg_texture == "depth":
+                    fg_rainbow = depth_to_rainbow(fg_pos_t, viewmat, device)
+                    rgb_render = torch.cat([bg_rgb_t, fg_rainbow], dim=0)
+                else:
+                    rgb_render = rgb_t
                 frames.append(render_frame(
-                    means3D, rgb_t, alpha_t, scales_t, rot_t,
+                    means3D, rgb_render, alpha_t, scales_t, rot_t,
                     viewmat, full_proj, campos, tanfovx, tanfovy, W, H, device,
                 ))
                 alpha_frames.append(render_frame(
