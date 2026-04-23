@@ -23,7 +23,7 @@ At each outer denoising step (sigma_t = t_norm):
          var    = sigma_t*(1-e^{-2*A*η}),  A = 1/sigma_t,  η = step_size
          x_t_vp ~ N(mean, var)
   4. VP→FM:  x_post = x_t_vp / f
-  5. Final model call → x0_final; pin fg: x0_final_fg ← y_latents
+  5. Final model call → x0_final; pin bg: x0_final_bg ← y_latents
   6. Scheduler step with v_eff = (x_post - x0_final) / sigma_t
   7. Hard bg replace: latent_bg = (1-sigma_next)*y_latents + sigma_next*noise
 
@@ -406,8 +406,8 @@ def main():
             v_pred = v_u + args.guide_scale * (v_c - v_u)
             x0_final = x_post - sigma_t * v_pred
 
-            # Pin fg to clean reference
-            x0_final = x0_final * (1 - fg_mask) + y_latents * fg_mask
+            # Pin bg to clean reference (preserve background; let model generate fg)
+            x0_final = x0_final * fg_mask + y_latents * (1 - fg_mask)
 
             # Effective velocity consistent with pinned x0
             v_eff = (x_post - x0_final) / sigma_t_safe
