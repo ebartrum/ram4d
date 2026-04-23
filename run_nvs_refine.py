@@ -19,7 +19,7 @@ At each outer denoising step (sigma_t = t_norm):
        Overdamped OU step (exact):
          x0_eff = x_t_vp + score
          mean   = e^{-A*η}*x_t_vp + (1-e^{-A*η})*sqrt(abt)*x0_eff
-         var    = sigma_t*(1-e^{-2*A*η}),  A = 1/sigma_t,  η = step_size
+         var    = sigma_t*(1-e^{-2*A*η}),  A = 1/sigma_t,  η = step_size*sigma_t  [keeps A*η=const]
          x_t_vp ~ N(mean, var)
   4. VP→FM:  x_post = x_t_vp / f
   5. Final model call → x0_final; pin bg: x0_final_bg ← y_latents
@@ -373,7 +373,9 @@ def main():
                 # Over one step of size eta:
                 #   mean = e^{-A*eta}*x + (1-e^{-A*eta})*sqrt(abt)*x0_eff
                 #   var  = sigma_t * (1 - e^{-2*A*eta})
-                A_eta   = args.langevin_step_size / sigma_t_safe   # = A * eta
+                # LanPaint scales step_size by sigma_t so A_eta = step_size/sigma = const.
+                # Without this, A_eta → ∞ at small sigma and the step becomes unstable.
+                A_eta   = args.langevin_step_size   # = (step_size * sigma_t) / sigma_t = const
                 exp_neg  = torch.exp(-A_eta)
                 exp_neg2 = torch.exp(-2.0 * A_eta)
 
