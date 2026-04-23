@@ -59,6 +59,7 @@ import argparse
 import gc
 import cv2
 import subprocess
+import math
 
 sys.path.insert(0, os.path.abspath("official_wan_repo"))
 
@@ -376,8 +377,8 @@ def main():
                 # LanPaint scales step_size by sigma_t so A_eta = step_size/sigma = const.
                 # Without this, A_eta → ∞ at small sigma and the step becomes unstable.
                 A_eta   = args.langevin_step_size   # = (step_size * sigma_t) / sigma_t = const
-                exp_neg  = torch.exp(-A_eta)
-                exp_neg2 = torch.exp(-2.0 * A_eta)
+                exp_neg  = math.exp(-A_eta)
+                exp_neg2 = math.exp(-2.0 * A_eta)
 
                 for _ in range(args.langevin_steps):
                     # Convert VP → FM, call model
