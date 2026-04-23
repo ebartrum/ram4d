@@ -6,9 +6,8 @@ Refine a 4DGS render video using Wan I2V with Langevin guidance.
 Algorithm: LanPaint IS_FLOW=True (closely following LanPaint/src/LanPaint/lanpaint.py).
 
 At each outer denoising step (sigma_t = t_norm):
-  1. Replace step: set bg to VE-noisy render (fg keeps current latent)
-       VE_sigma = sigma_t / (1-sigma_t)
-       x_replaced = x_fg*fg_mask + (y_latents + VE_sigma*noise)*(1-fg_mask)
+  1. Replace step: reset bg to FM-noisy render (fg keeps current latent)
+       x_replaced = x_fg*fg_mask + ((1-sigma_t)*y_latents + sigma_t*noise)*(1-fg_mask)
   2. VP conversion:  f = sqrt(1-sigma_t) + sqrt(sigma_t)
                     x_t_vp = x_replaced * f
   3. N inner Langevin steps (each makes a model call):
@@ -241,6 +240,7 @@ def main():
     # Expand to all 16 latent channels
     fg_mask_latent = fg_mask_latent.repeat(1, 16, 1, 1, 1).to(device)  # [1, 16, F_lat, H_lat, W_lat]
     fg_mask = fg_mask_latent.squeeze(0)                                  # [16, F_lat, H_lat, W_lat]
+    fg_mask[:, 0, :, :] = 0  # frame 0 is the I2V conditioning frame — never modify it
     print(f"Fg mask: shape={fg_mask.shape}, fg_fraction={fg_mask.mean():.3f}")
 
     # ------------------------------------------------------------------
@@ -347,11 +347,9 @@ def main():
 
             if args.langevin_steps > 0:
                 # ---- 1. Replace step (LanPaint __call__ line 60) ----
-                # Force fg to match the VE-noisy reference render.
-                # VE_sigma = sigma_FM / (1 - sigma_FM)  [flow-matching → VE parameterisation]
-                abt_safe = abt.clamp(min=1e-4)
-                VE_sigma = sigma_t / abt_safe
-                x_replaced = latent * fg_mask + (y_latents + VE_sigma * noise) * (1 - fg_mask)
+                # Reset bg to the FM-noisy reference at the current timestep.
+                # For flow matching: x_t = (1-sigma_t)*x0 + sigma_t*noise
+                x_replaced = latent * fg_mask + ((1.0 - sigma_t) * y_latents + sigma_t * noise) * (1 - fg_mask)
 
                 # ---- 2. VP conversion (LanPaint line 63) ----
                 x_t_vp = x_replaced * f
