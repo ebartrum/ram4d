@@ -6,16 +6,16 @@ Refine a 4DGS render video using Wan I2V with Langevin guidance.
 Algorithm: LanPaint IS_FLOW=True (closely following LanPaint/src/LanPaint/lanpaint.py).
 
 At each outer denoising step (sigma_t = t_norm):
-  1. Replace step: reset bg to FM-noisy render (fg keeps current latent)
-       x_replaced = x_fg*fg_mask + ((1-sigma_t)*y_latents + sigma_t*noise)*(1-fg_mask)
+  1. Replace step: reset fg to FM-noisy render (bg keeps current latent)
+       x_replaced = x_bg*(1-fg_mask) + ((1-sigma_t)*y_latents + sigma_t*noise)*fg_mask
   2. VP conversion:  f = sqrt(1-sigma_t) + sqrt(sigma_t)
                     x_t_vp = x_replaced * f
   3. N inner Langevin steps (each makes a model call):
        x_fm = x_t_vp / f
        x0_fm = x_fm - sigma_t * CFG_velocity(x_fm, t)
-       score_x = -(x_t_vp - x0_fm)                                [fg, free generation]
-       score_y = -(1+λ)*(x_t_vp - y_latents) + λ*(x_t_vp-x0_fm)  [bg, guided toward render]
-       score   = score_x*fg_mask + score_y*(1-fg_mask)
+       score_x = -(x_t_vp - x0_fm)                                [bg, free generation]
+       score_y = -(1+λ)*(x_t_vp - y_latents) + λ*(x_t_vp-x0_fm)  [fg, guided toward render]
+       score   = score_x*(1-fg_mask) + score_y*fg_mask
        Overdamped OU step (exact):
          x0_eff = x_t_vp + score
          mean   = e^{-A*η}*x_t_vp + (1-e^{-A*η})*sqrt(abt)*x0_eff
@@ -363,7 +363,7 @@ def main():
                 # ---- 1. Replace step (LanPaint __call__ line 60) ----
                 # Reset bg to the FM-noisy reference at the current timestep.
                 # For flow matching: x_t = (1-sigma_t)*x0 + sigma_t*noise
-                x_replaced = latent * fg_mask + ((1.0 - sigma_t) * y_latents + sigma_t * noise) * (1 - fg_mask)
+                x_replaced = latent * (1 - fg_mask) + ((1.0 - sigma_t) * y_latents + sigma_t * noise) * fg_mask
 
                 # ---- 2. VP conversion (LanPaint line 63) ----
                 x_t_vp = x_replaced * f
@@ -390,7 +390,7 @@ def main():
                     score_x = -(x_t_vp - x0_fm)
                     score_y = (-(1.0 + args.lambda_val) * (x_t_vp - y_latents)
                                + args.lambda_val * (x_t_vp - x0_fm))
-                    score   = score_x * fg_mask + score_y * (1 - fg_mask)
+                    score   = score_x * (1 - fg_mask) + score_y * fg_mask
 
                     # Effective attractor: x0_eff = x_t_vp + score
                     #   bg: x0_eff = x0_fm
