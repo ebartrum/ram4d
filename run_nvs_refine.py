@@ -58,6 +58,7 @@ import torchvision.transforms.functional as TF
 import argparse
 import gc
 import cv2
+import subprocess
 
 sys.path.insert(0, os.path.abspath("official_wan_repo"))
 
@@ -151,8 +152,21 @@ def main():
     out_dir = args.output_dir
     os.makedirs(out_dir, exist_ok=True)
 
-    # Save args for reference
-    with open(os.path.join(out_dir, "nvs_refine_args.txt"), "w") as f:
+    # Save experiment details
+    def _git(cmd):
+        try:
+            return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            return "unknown"
+
+    git_commit = _git(["git", "rev-parse", "--short", "HEAD"])
+    git_branch = _git(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+
+    with open(os.path.join(out_dir, "expt_details.txt"), "w") as f:
+        f.write("# git details\n")
+        f.write(f"commit: {git_commit}\n")
+        f.write(f"branch: {git_branch}\n")
+        f.write("\n# arguments\n")
         for k, v in vars(args).items():
             f.write(f"{k}: {v}\n")
 
