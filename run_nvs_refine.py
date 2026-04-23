@@ -6,17 +6,17 @@ Refine a 4DGS render video using Wan I2V with Langevin guidance.
 Algorithm: LanPaint IS_FLOW=True (closely following LanPaint/src/LanPaint/lanpaint.py).
 
 At each outer denoising step (sigma_t = t_norm):
-  1. Replace step: set fg to VE-noisy render
+  1. Replace step: set bg to VE-noisy render (fg keeps current latent)
        VE_sigma = sigma_t / (1-sigma_t)
-       x_replaced = x_bg*(1-fg_mask) + (y_latents + VE_sigma*noise)*fg_mask
+       x_replaced = x_fg*fg_mask + (y_latents + VE_sigma*noise)*(1-fg_mask)
   2. VP conversion:  f = sqrt(1-sigma_t) + sqrt(sigma_t)
                     x_t_vp = x_replaced * f
   3. N inner Langevin steps (each makes a model call):
        x_fm = x_t_vp / f
        x0_fm = x_fm - sigma_t * CFG_velocity(x_fm, t)
-       score_x = -(x_t_vp - x0_fm)                            [bg]
-       score_y = -(1+λ)*(x_t_vp - y_latents) + λ*(x_t_vp-x0_fm)  [fg, CLEAN y_latents]
-       score   = score_x*(1-fg_mask) + score_y*fg_mask
+       score_x = -(x_t_vp - x0_fm)                                [fg, free generation]
+       score_y = -(1+λ)*(x_t_vp - y_latents) + λ*(x_t_vp-x0_fm)  [bg, guided toward render]
+       score   = score_x*fg_mask + score_y*(1-fg_mask)
        Overdamped OU step (exact):
          x0_eff = x_t_vp + score
          mean   = e^{-A*η}*x_t_vp + (1-e^{-A*η})*sqrt(abt)*x0_eff
@@ -120,8 +120,8 @@ def main():
                         help="front_frame0.png — I2V conditioning image (frame 0)")
     parser.add_argument("--prompt_path",     type=str, required=True,
                         help="Text prompt .txt file")
-    parser.add_argument("--output_path",     type=str, required=True,
-                        help="Output .mp4 path")
+    parser.add_argument("--output_dir",      type=str, required=True,
+                        help="Output directory (final.mp4 + step_NNN.mp4 previews saved here)")
     parser.add_argument("--lambda_val",      type=float, default=4.0,
                         help="Fg guidance strength (0=loose, inf=locked to render)")
     parser.add_argument("--langevin_steps",  type=int,   default=5,
@@ -149,7 +149,7 @@ def main():
                              "Requires checkpoints/taew2_1.pth.")
     args = parser.parse_args()
 
-    out_dir = os.path.dirname(os.path.abspath(args.output_path))
+    out_dir = args.output_dir
     os.makedirs(out_dir, exist_ok=True)
 
     # Save args for reference
@@ -328,9 +328,6 @@ def main():
         else:
             print(f"WARNING: --preview_interval set but {taehv_ckpt} not found; previews disabled.")
 
-    preview_dir = os.path.join(out_dir, "previews")
-    if taehv is not None:
-        os.makedirs(preview_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
     # 5. Denoising loop — LanPaint IS_FLOW=True
@@ -354,7 +351,7 @@ def main():
                 # VE_sigma = sigma_FM / (1 - sigma_FM)  [flow-matching → VE parameterisation]
                 abt_safe = abt.clamp(min=1e-4)
                 VE_sigma = sigma_t / abt_safe
-                x_replaced = latent * (1 - fg_mask) + (y_latents + VE_sigma * noise) * fg_mask
+                x_replaced = latent * fg_mask + (y_latents + VE_sigma * noise) * (1 - fg_mask)
 
                 # ---- 2. VP conversion (LanPaint line 63) ----
                 x_t_vp = x_replaced * f
@@ -381,7 +378,7 @@ def main():
                     score_x = -(x_t_vp - x0_fm)
                     score_y = (-(1.0 + args.lambda_val) * (x_t_vp - y_latents)
                                + args.lambda_val * (x_t_vp - x0_fm))
-                    score   = score_x * (1 - fg_mask) + score_y * fg_mask
+                    score   = score_x * fg_mask + score_y * (1 - fg_mask)
 
                     # Effective attractor: x0_eff = x_t_vp + score
                     #   bg: x0_eff = x0_fm
@@ -435,7 +432,7 @@ def main():
                     preview_frames = taehv.decode([x0_final.float()])[0]  # [3, T, H, W] in [-1,1]
                 cache_video(
                     tensor=preview_frames[None],
-                    save_file=os.path.join(preview_dir, f"step_{i+1:03d}.mp4"),
+                    save_file=os.path.join(out_dir, f"step_{i+1:03d}.mp4"),
                     fps=16, nrow=1, normalize=True, value_range=(-1, 1),
                 )
 
@@ -450,13 +447,13 @@ def main():
 
     cache_video(
         tensor=videos[0][None],
-        save_file=args.output_path,
+        save_file=os.path.join(out_dir, "final.mp4"),
         fps=16,
         nrow=1,
         normalize=True,
         value_range=(-1, 1),
     )
-    print(f"Saved → {args.output_path}")
+    print(f"Saved → {os.path.join(out_dir, 'final.mp4')}")
 
 
 if __name__ == "__main__":
