@@ -6,11 +6,10 @@ Refine a 4DGS render video using Wan I2V with Langevin guidance.
 Algorithm: LanPaint IS_FLOW=True (closely following LanPaint/src/LanPaint/lanpaint.py).
 
 At each outer denoising step (sigma_t = t_norm):
-  1. Replace step: reset fg to FM-noisy render (bg keeps current latent)
-       x_replaced = x_bg*(1-fg_mask) + ((1-sigma_t)*y_latents + sigma_t*noise)*fg_mask
-  2. VP conversion:  f = sqrt(1-sigma_t) + sqrt(sigma_t)
-                    x_t_vp = x_replaced * f
-  3. N inner Langevin steps (each makes a model call):
+  1. VP conversion:  f = sqrt(1-sigma_t) + sqrt(sigma_t)
+                    x_t_vp = latent * f
+     (No fg replace step — fg accumulates model improvements; score_y provides soft pull toward render)
+  2. N inner Langevin steps (each makes a model call):
        x_fm = x_t_vp / f
        x0_fm = x_fm - sigma_t * CFG_velocity(x_fm, t)
        score_x = -(x_t_vp - x0_fm)                                [bg, free generation]
@@ -21,10 +20,10 @@ At each outer denoising step (sigma_t = t_norm):
          mean   = e^{-A*η}*x_t_vp + (1-e^{-A*η})*sqrt(abt)*x0_eff
          var    = sigma_t*(1-e^{-2*A*η}),  A = 1/sigma_t,  η = step_size*sigma_t  [keeps A*η=const]
          x_t_vp ~ N(mean, var)
-  4. VP→FM:  x_post = x_t_vp / f
-  5. Final model call → x0_final; pin bg: x0_final_bg ← y_latents
-  6. Scheduler step with v_eff = (x_post - x0_final) / sigma_t
-  7. Hard bg replace: latent_bg = (1-sigma_next)*y_latents + sigma_next*noise
+  3. VP→FM:  x_post = x_t_vp / f
+  4. Final model call → x0_final; pin bg: x0_final_bg ← y_latents
+  5. Scheduler step with v_eff = (x_post - x0_final) / sigma_t
+  6. Hard bg replace: latent_bg = (1-sigma_next)*y_latents + sigma_next*noise
 
 NOTE: With n_inner inner steps, each outer denoising step makes 2*(n_inner+1) model
 passes (CFG = 2 per call).  Default 5 inner steps → 480 passes for 40 outer steps.
@@ -361,15 +360,12 @@ def main():
             f = abt.sqrt() + sigma_t_safe.sqrt()
 
             if args.langevin_steps > 0:
-                # ---- 1. Replace step (LanPaint __call__ line 60) ----
-                # Reset bg to the FM-noisy reference at the current timestep.
-                # For flow matching: x_t = (1-sigma_t)*x0 + sigma_t*noise
-                x_replaced = latent * (1 - fg_mask) + ((1.0 - sigma_t) * y_latents + sigma_t * noise) * fg_mask
+                # ---- 1. VP conversion (LanPaint line 63) ----
+                # No fg replace step: fg accumulates model improvements across outer steps.
+                # score_y provides soft pull toward y_latents via Langevin.
+                x_t_vp = latent * f
 
-                # ---- 2. VP conversion (LanPaint line 63) ----
-                x_t_vp = x_replaced * f
-
-                # ---- 3. Inner Langevin steps ----
+                # ---- 2. Inner Langevin steps ----
                 # Overdamped OU (exact): A = 1/sigma_t, D = sqrt(2).
                 # Over one step of size eta:
                 #   mean = e^{-A*eta}*x + (1-e^{-A*eta})*sqrt(abt)*x0_eff
@@ -405,14 +401,14 @@ def main():
                     var    = sigma_t_safe * (1.0 - exp_neg2)
                     x_t_vp = mean + var.clamp(min=0.0).sqrt() * torch.randn_like(x_t_vp)
 
-                # ---- 4. VP → FM ----
+                # ---- 3. VP → FM ----
                 x_post = x_t_vp / f
 
             else:
                 # No Langevin: standard denoising from scheduler-updated latent
                 x_post = latent
 
-            # ---- 5. Final model call (LanPaint lines 117-120) ----
+            # ---- 4. Final model call (LanPaint lines 117-120) ----
             v_c    = wan_i2v.model([x_post], t=torch.stack([t]), **arg_c)[0]
             v_u    = wan_i2v.model([x_post], t=torch.stack([t]), **arg_null)[0]
             v_pred = v_u + args.guide_scale * (v_c - v_u)
