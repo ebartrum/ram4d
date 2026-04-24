@@ -149,6 +149,11 @@ def main():
     parser.add_argument("--preview_interval", type=int,  default=0,
                         help="Save a TAEHV preview video every N denoising steps (0=disabled). "
                              "Requires checkpoints/taew2_1.pth.")
+    parser.add_argument("--sdedit_strength", type=float, default=1.0,
+                        help="SDEdit noise level ∈ (0,1]. 1.0=pure noise (standard); "
+                             "<1.0 initialises fg from y_latents noised to this sigma level "
+                             "and skips earlier denoising steps. e.g. 0.95 skips the first "
+                             "high-noise steps where the model commits to its own motion prior.")
     args = parser.parse_args()
 
     out_dir = args.output_dir
@@ -324,7 +329,23 @@ def main():
         16, f_lat, lat_h, lat_w,
         dtype=torch.float32, generator=seed_g, device=device,
     )
-    latent = noise.clone()
+
+    # SDEdit: optionally start from partially-noised y_latents rather than pure noise.
+    # Find the first scheduler step where sigma_t <= sdedit_strength and initialise there.
+    sdedit_start_step = 0
+    if args.sdedit_strength < 1.0:
+        for j, sig in enumerate(scheduler.sigmas[:-1]):  # exclude final sigma=0
+            if sig <= args.sdedit_strength:
+                sdedit_start_step = j
+                break
+        t_sdedit = timesteps[sdedit_start_step]
+        latent = scheduler.add_noise(
+            y_latents.unsqueeze(0), noise.unsqueeze(0), torch.stack([t_sdedit]),
+        ).squeeze(0)
+        print(f"SDEdit: starting from step {sdedit_start_step} "
+              f"(sigma={scheduler.sigmas[sdedit_start_step]:.3f})")
+    else:
+        latent = noise.clone()
 
     max_seq_len = f_lat * lat_h * lat_w // (patch_size[1] * patch_size[2])
     arg_c    = {'context': [context[0]],  'clip_fea': clip_context, 'seq_len': max_seq_len, 'y': [y_cond]}
@@ -354,6 +375,8 @@ def main():
 
     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=wan_i2v.param_dtype):
         for i, t in enumerate(tqdm(timesteps)):
+            if i < sdedit_start_step:
+                continue
             sigma_t = scheduler.sigmas[i].to(device)       # ≈ t_norm ∈ (0,1)
             abt     = (1.0 - sigma_t).clamp(min=0.0)       # alpha_bar_t = 1 - t_norm
             sigma_t_safe = sigma_t.clamp(min=1e-4)
