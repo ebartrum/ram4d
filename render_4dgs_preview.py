@@ -182,8 +182,10 @@ def render_view(means3D, colors, opacities, scales, rotations,
 def main():
     args = parse_args()
     gaussians_dir = args.gaussians_dir
-    ply_path      = os.path.join(gaussians_dir, "gaussians.ply")
-    offsets_path  = os.path.join(gaussians_dir, "deformation_offsets.npy")
+    ply_path       = os.path.join(gaussians_dir, "gaussians.ply")
+    offsets_path   = os.path.join(gaussians_dir, "deformation_offsets.npy")
+    scales_path    = os.path.join(gaussians_dir, "deformation_scales.npy")
+    rotations_path = os.path.join(gaussians_dir, "deformation_rotations.npy")
 
     W = H = args.size
     azimuths = DEFAULT_AZIMUTHS_DEG
@@ -213,15 +215,22 @@ def main():
         cameras.append((vm, fp, cp, tanfov))
         print(f"  azimuth {az:4d}° ready  (tanfov={tanfov:.5f})")
 
-    # Deformation offsets
+    # Deformation arrays
     if os.path.exists(offsets_path):
         offsets = np.load(offsets_path)   # (T, N, 3)
         T = offsets.shape[0]
-        print(f"\n  Deformation offsets: {offsets.shape}")
+        print(f"\n  Deformation offsets:   {offsets.shape}")
     else:
         offsets = None
         T = 1
         print("\n  No offsets found — static frame only.")
+
+    deform_scales = np.load(scales_path)    if os.path.exists(scales_path) else None
+    deform_rots   = np.load(rotations_path) if os.path.exists(rotations_path) else None
+    if deform_scales is not None:
+        print(f"  Deformation scales:    {deform_scales.shape}")
+    if deform_rots is not None:
+        print(f"  Deformation rotations: {deform_rots.shape}")
 
     # Render
     n_views = len(azimuths)
@@ -232,9 +241,17 @@ def main():
         if offsets is not None:
             pos = xyz_t + torch.from_numpy(offsets[t]).float().to(device)
 
+        sc = scales_t
+        if deform_scales is not None:
+            sc = scales_t * torch.from_numpy(deform_scales[t]).float().to(device).unsqueeze(1)
+
+        rot = rot_t
+        if deform_rots is not None:
+            rot = torch.from_numpy(deform_rots[t]).float().to(device)
+
         view_imgs = []
         for az, (vm, fp, cp, tanfov) in zip(azimuths, cameras):
-            img = render_view(pos, rgb_t, alpha_t, scales_t, rot_t,
+            img = render_view(pos, rgb_t, alpha_t, sc, rot,
                               vm, fp, cp, tanfov, W, H, device)
             view_imgs.append(img)
 
