@@ -464,6 +464,96 @@ def compute_deformation_scale_factors(areas_all, max_areas_f, tri_indices):
     return np.sqrt(ratio).astype(np.float32)
 
 
+def compute_deformation_rotations(mesh, deformations_mesh, tri_indices):
+    """
+    Compute per-frame per-Gaussian quaternions by tracking the face tangent frame.
+
+    At each frame the tangent/bitangent/normal axes are recomputed from the
+    deformed vertex positions, keeping UVs fixed (texture-consistent tangent).
+
+    Args:
+        deformations_mesh: (T, V, 3) vertex positions in mesh space
+        tri_indices:       (N,) triangle index for each Gaussian
+
+    Returns:
+        rotations: (T, N, 4) float32 quaternions in wxyz order
+    """
+    T = deformations_mesh.shape[0]
+    N = tri_indices.shape[0]
+
+    t_pos_idx = mesh.t_pos_idx.cpu().numpy()  # (F, 3)
+    v_tex = mesh.v_tex.cpu().numpy()          # (V_uv, 2)
+    t_tex_idx = mesh.t_tex_idx.cpu().numpy()  # (F, 3)
+
+    v0_idx = t_pos_idx[tri_indices, 0]  # (N,)
+    v1_idx = t_pos_idx[tri_indices, 1]
+    v2_idx = t_pos_idx[tri_indices, 2]
+
+    # Precompute UV-space Jacobian inverse — constant across frames (UVs don't deform)
+    uv_idx0 = t_tex_idx[tri_indices, 0]
+    uv_idx1 = t_tex_idx[tri_indices, 1]
+    uv_idx2 = t_tex_idx[tri_indices, 2]
+    uv0 = v_tex[uv_idx0]; uv1 = v_tex[uv_idx1]; uv2 = v_tex[uv_idx2]
+    sduv1 = uv1 - uv0  # (N, 2)
+    sduv2 = uv2 - uv0
+    D = np.stack([
+        np.stack([sduv1[:, 0], sduv2[:, 0]], axis=-1),
+        np.stack([sduv1[:, 1], sduv2[:, 1]], axis=-1),
+    ], axis=-2)  # (N, 2, 2)
+    det = D[:, 0, 0] * D[:, 1, 1] - D[:, 0, 1] * D[:, 1, 0]
+    degenerate_uv = (np.abs(det) < 1e-10)
+    D_inv = np.zeros_like(D)
+    ok = ~degenerate_uv
+    D_inv[ok, 0, 0] =  D[ok, 1, 1] / det[ok]
+    D_inv[ok, 0, 1] = -D[ok, 0, 1] / det[ok]
+    D_inv[ok, 1, 0] = -D[ok, 1, 0] / det[ok]
+    D_inv[ok, 1, 1] =  D[ok, 0, 0] / det[ok]
+
+    rotations = np.zeros((T, N, 4), dtype=np.float32)
+
+    for t in range(T):
+        verts = deformations_mesh[t]  # (V, 3)
+        sv0 = verts[v0_idx]; sv1 = verts[v1_idx]; sv2 = verts[v2_idx]
+        dp1 = sv1 - sv0  # (N, 3)
+        dp2 = sv2 - sv0
+
+        # Normal
+        normal_raw = np.cross(dp1, dp2)
+        normal_len = np.linalg.norm(normal_raw, axis=-1, keepdims=True)
+        normal = normal_raw / np.maximum(normal_len, 1e-10)
+
+        # Tangent from UV Jacobian
+        dp_mat = np.stack([dp1, dp2], axis=-1)  # (N, 3, 2)
+        J = dp_mat @ D_inv                       # (N, 3, 2)
+        tangent = J[:, :, 0].copy()
+        tang_len = np.linalg.norm(tangent, axis=-1, keepdims=True)
+        fallback = dp1 / np.maximum(np.linalg.norm(dp1, axis=-1, keepdims=True), 1e-10)
+        use_fallback = (tang_len[:, 0] < 1e-10) | degenerate_uv
+        tangent = np.where(use_fallback[:, None], fallback, tangent)
+        tangent = tangent / np.maximum(np.linalg.norm(tangent, axis=-1, keepdims=True), 1e-10)
+
+        # Bitangent
+        bitangent = np.cross(normal, tangent)
+        bitan_len = np.linalg.norm(bitangent, axis=-1, keepdims=True)
+        bad = bitan_len[:, 0] < 1e-10
+        if bad.any():
+            perp = np.zeros_like(tangent); perp[:, 0] = 1.0
+            alt = np.cross(normal, perp)
+            alt = alt / np.maximum(np.linalg.norm(alt, axis=-1, keepdims=True), 1e-10)
+            bitangent[bad] = alt[bad]
+            bitan_len[bad] = np.linalg.norm(bitangent[bad], axis=-1, keepdims=True)
+        bitangent = bitangent / np.maximum(bitan_len, 1e-10)
+
+        rot_matrix = np.stack([tangent, bitangent, normal], axis=-1)  # (N, 3, 3)
+        rot_t = torch.from_numpy(rot_matrix.astype(np.float32))
+        rotations[t] = rotation_matrix_to_quaternion(rot_t).numpy()
+
+        if t % 10 == 0:
+            print(f"  Frame {t}/{T}")
+
+    return rotations
+
+
 def write_gaussians_ply(path, centroid, log_scale, quaternion, f_dc, opacity, num_sh_rest=45, num_obj_dc=16):
     """
     Write 3DGS PLY file compatible with Inpaint360GS GaussianModel.load_ply().
@@ -582,9 +672,10 @@ def main():
     N = gaussians["centroid"].shape[0]
     print(f"  N Gaussians: {N}")
 
-    # --- Compute deformation offsets and scale factors ---
+    # --- Compute deformation offsets, scale factors, and rotations ---
     offsets = None
     scale_factors = None
+    rotations = None
     if deformations_mesh is not None:
         print("\n--- Computing deformation offsets ---")
         offsets = compute_deformation_offsets(
@@ -603,6 +694,12 @@ def main():
         )
         print(f"  Scale factors shape: {scale_factors.shape}")
         print(f"  Scale factor range: [{scale_factors.min():.4f}, {scale_factors.max():.4f}]")
+
+        print("\n--- Computing deformation rotations ---")
+        rotations = compute_deformation_rotations(
+            mesh, deformations_mesh, gaussians["tri_indices"]
+        )
+        print(f"  Rotations shape: {rotations.shape}")
 
     # --- Write outputs ---
     print("\n--- Writing outputs ---")
@@ -629,12 +726,19 @@ def main():
         np.save(scales_path, scale_factors.astype(np.float32))
         print(f"  Written: {scales_path}")
 
+    if rotations is not None:
+        rotations_path = os.path.join(gaussians_dir, "deformation_rotations.npy")
+        np.save(rotations_path, rotations.astype(np.float32))
+        print(f"  Written: {rotations_path}")
+
     print(f"\nDone.")
     print(f"  N Gaussians: {N}")
     if offsets is not None:
         print(f"  Deformation offsets shape: {offsets.shape}")
     if scale_factors is not None:
         print(f"  Deformation scales shape: {scale_factors.shape}")
+    if rotations is not None:
+        print(f"  Deformation rotations shape: {rotations.shape}")
 
 
 if __name__ == "__main__":
