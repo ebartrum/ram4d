@@ -13,10 +13,12 @@ At each outer denoising step (sigma_t = t_norm):
        x_fm = x_t_vp / f
        x0_fm = x_fm - sigma_t * CFG_velocity(x_fm, t)
        score_x = -(x_t_vp - x0_fm)                                [bg, free generation]
-       score_y = -(x_t_vp - x0_fm) - λ*(x_t_vp - y_latents)      [fg: λ=0→free, λ→∞→locked to render]
+       score_y = -(x_t_vp - x0_fm) + λ*(y_latents - x0_fm)        [fg: λ=0→free, λ=1→locked to render]
        score   = score_x*(1-fg_mask) + score_y*fg_mask
        Overdamped OU step (exact):
          x0_eff = x_t_vp + score
+           bg:  x0_eff = x0_fm
+           fg:  x0_eff = x0_fm + λ*(y_latents - x0_fm)  [stable interpolation, no x_t_vp dependence]
          mean   = e^{-A*η}*x_t_vp + (1-e^{-A*η})*sqrt(abt)*x0_eff
          var    = sigma_t*(1-e^{-2*A*η}),  A = 1/sigma_t,  η = step_size*sigma_t  [keeps A*η=const]
          x_t_vp ~ N(mean, var)
@@ -387,12 +389,12 @@ def main():
                     # Score (LanPaint score_model IS_FLOW, lines 139-141).
                     # x_t_vp is VP; x0_fm and y_latents are FM — LanPaint mixes spaces.
                     score_x = -(x_t_vp - x0_fm)
-                    score_y = -(x_t_vp - x0_fm) - args.lambda_val * (x_t_vp - y_latents)
+                    score_y = -(x_t_vp - x0_fm) + args.lambda_val * (y_latents - x0_fm)
                     score   = score_x * (1 - fg_mask) + score_y * fg_mask
 
                     # Effective attractor: x0_eff = x_t_vp + score
                     #   bg: x0_eff = x0_fm
-                    #   fg: x0_eff = (1+λ)*y_latents - λ*x0_fm
+                    #   fg: x0_eff = x0_fm + λ*(y_latents - x0_fm)  [stable: no x_t_vp dependence]
                     x0_eff = x_t_vp + score
 
                     # Exact OU step
