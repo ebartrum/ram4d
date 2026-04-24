@@ -6,12 +6,18 @@ random barycentric coordinates). Scale and orientation are derived from the
 containing triangle's local frame (UV-to-3D Jacobian). Deformation offsets use
 barycentric interpolation of per-vertex deformations.
 
+When deformations are present, sampling uses the maximum face area across all
+frames (not just frame 0) so that faces which expand later get enough Gaussians.
+A per-Gaussian per-frame scale factor sqrt(area_t / max_area) is also saved so
+the splats shrink when the face contracts, avoiding over-coverage.
+
 Outputs:
-  <output_dir>/gaussians.ply         — 3DGS PLY (Inpaint360GS compatible)
-  <output_dir>/deformation_offsets.npy — (T, N_tri, 3) xyz offsets
+  <output_dir>/gaussians.ply              — 3DGS PLY (Inpaint360GS compatible)
+  <output_dir>/deformation_offsets.npy   — (T, N, 3) xyz offsets
+  <output_dir>/deformation_scales.npy    — (T, N) per-Gaussian scale multipliers
 
 Usage:
-  python mesh_to_4dgs.py --input_mesh output/2026.03.03/actionmesh_gs_replace_corgi --output_dir output/2026.04.16/corgi_gaussians
+  python mesh_to_4dgs.py --input_mesh output/2026.03.03/actionmesh_gs_replace_corgi --output_dir output/2026.04.24/corgi_gaussians_200k
   python mesh_to_4dgs.py --input_mesh ... --output_dir ... --n_gaussians 40000 --sigma 0.65
 """
 
@@ -171,13 +177,18 @@ def sample_texture_at_uvs(texture_np, uvs):
     return rgb.astype(np.float32)
 
 
-def sample_surface_gaussians(mesh, texture_np, sigma, n_gaussians, seed=0):
+def sample_surface_gaussians(mesh, texture_np, sigma, n_gaussians, seed=0, max_areas_f=None):
     """
-    Sample Gaussians uniformly by surface area from the frame-0 mesh.
+    Sample Gaussians uniformly by surface area.
 
     Each Gaussian is placed at a random point inside a triangle, with triangles
     selected proportional to their area. Barycentric coordinates are stored for
     use in deformation offset computation.
+
+    Args:
+        max_areas_f: (F,) optional per-face max area across all frames. When
+            provided, sampling weights and global scale are based on these rather
+            than frame-0 areas, ensuring faces that expand later get enough splats.
 
     Returns dict with keys:
       centroid    (N, 3)  — 3D positions
@@ -209,14 +220,17 @@ def sample_surface_gaussians(mesh, texture_np, sigma, n_gaussians, seed=0):
     dp1 = v1 - v0  # (F, 3)
     dp2 = v2 - v0
 
-    # --- Surface normals ---
+    # --- Surface normals (frame-0 geometry, used for rotation/tangent frame) ---
     normal_raw = np.cross(dp1, dp2)  # (F, 3)
     norm_len = np.linalg.norm(normal_raw, axis=-1, keepdims=True)
     degenerate_tri = (norm_len[:, 0] < 1e-10)
-    areas = norm_len[:, 0] / 2.0  # triangle area = |cross| / 2
+    areas_frame0 = norm_len[:, 0] / 2.0  # triangle area = |cross| / 2
 
     # --- Area-weighted triangle sampling ---
-    areas_safe = np.maximum(areas, 0.0)
+    # Use max_areas_f (max over time) if provided so that faces which expand
+    # in later frames receive proportionally more Gaussians.
+    sampling_areas = max_areas_f if max_areas_f is not None else areas_frame0
+    areas_safe = np.maximum(sampling_areas, 0.0)
     total_area = areas_safe.sum()
     if total_area < 1e-12:
         raise ValueError("Mesh has zero total surface area.")
@@ -328,22 +342,17 @@ def sample_surface_gaussians(mesh, texture_np, sigma, n_gaussians, seed=0):
     }
 
 
-def compute_deformation_offsets(mesh, deformations_path, tri_indices, bary_coords, pos_0, offset, scale):
+def load_deformations(mesh, deformations_path, offset, scale):
     """
-    Compute per-frame position offsets for each sampled Gaussian using barycentric interpolation.
-
-    Args:
-        tri_indices: (N,) triangle index for each Gaussian
-        bary_coords: (N, 3) barycentric weights (w0, w1, w2)
-        pos_0: (N, 3) frame-0 positions (used to compute relative offsets)
+    Load deformations_vertices.npy, undo coordinate transform, apply mesh
+    transforms, and remap to mesh vertex ordering via nearest neighbour.
 
     Returns:
-        offsets: (T, N, 3) float32 array
+        deformations_mesh: (T, V_mesh, 3) vertex positions in mesh space
     """
     print("  Loading deformations...")
-    deformations = np.load(deformations_path)  # (T, V, 3)
+    deformations = np.load(deformations_path)  # (T, V_orig, 3)
     T = deformations.shape[0]
-    N = tri_indices.shape[0]
     print(f"  Deformations shape: {deformations.shape}")
 
     # Undo save_deformation coordinate transform: saved as [-z, x, y] -> restore [x, y, z]
@@ -358,42 +367,101 @@ def compute_deformation_offsets(mesh, deformations_path, tri_indices, bary_coord
             deformations_orig[i], offset, scale, front_x_to_y=True
         )
 
-    # Compute nearest-neighbour mapping: mesh verts -> deformation verts
+    # NN mapping: mesh verts -> deformation verts (frame 0)
     print("  Computing vertex NN mapping...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    v_mesh = mesh.v_pos.to(device)                                         # (V, 3)
-    v_orig = torch.from_numpy(deformations_orig[0]).float().to(device)    # (V_orig, 3)
-
+    v_mesh = mesh.v_pos.to(device)
+    v_orig = torch.from_numpy(deformations_orig[0]).float().to(device)
     dist_matrix = torch.cdist(v_mesh.unsqueeze(0), v_orig.unsqueeze(0)).squeeze(0)
     min_dist, mapping_idx = torch.min(dist_matrix, dim=1)
     avg_dist = torch.mean(min_dist).item()
     print(f"  NN mapping avg distance: {avg_dist:.6f}")
     if avg_dist > 1e-4:
         print("  WARNING: High avg distance — possible misalignment between mesh and deformations.")
-    mapping_idx_np = mapping_idx.cpu().numpy()  # (V,) maps mesh vert -> deformation vert
+    mapping_idx_np = mapping_idx.cpu().numpy()  # (V_mesh,)
 
-    # Precompute per-Gaussian vertex indices in deformation array
+    # Remap to mesh vertex ordering: (T, V_mesh, 3)
+    return deformations_orig[:, mapping_idx_np, :]
+
+
+def compute_face_areas(mesh, deformations_mesh):
+    """
+    Compute per-face surface area at each frame.
+
+    Returns:
+        areas_all:   (T, F) float32
+        max_areas_f: (F,)  float32 — max area per face across all frames
+    """
     t_pos_idx = mesh.t_pos_idx.cpu().numpy()  # (F, 3)
-    v0_idx = mapping_idx_np[t_pos_idx[tri_indices, 0]]  # (N,)
-    v1_idx = mapping_idx_np[t_pos_idx[tri_indices, 1]]
-    v2_idx = mapping_idx_np[t_pos_idx[tri_indices, 2]]
+    idx0, idx1, idx2 = t_pos_idx[:, 0], t_pos_idx[:, 1], t_pos_idx[:, 2]
+    T = deformations_mesh.shape[0]
+    F = t_pos_idx.shape[0]
+
+    areas_all = np.zeros((T, F), dtype=np.float32)
+    for t in range(T):
+        verts = deformations_mesh[t]  # (V, 3)
+        dp1 = verts[idx1] - verts[idx0]
+        dp2 = verts[idx2] - verts[idx0]
+        areas_all[t] = np.linalg.norm(np.cross(dp1, dp2), axis=-1) / 2.0
+
+    max_areas_f = areas_all.max(axis=0)  # (F,)
+    return areas_all, max_areas_f
+
+
+def compute_deformation_offsets(mesh, deformations_mesh, tri_indices, bary_coords, pos_0):
+    """
+    Compute per-frame position offsets for each sampled Gaussian using barycentric interpolation.
+
+    Args:
+        deformations_mesh: (T, V, 3) vertex positions in mesh space (from load_deformations)
+        tri_indices: (N,) triangle index for each Gaussian
+        bary_coords: (N, 3) barycentric weights (w0, w1, w2)
+        pos_0: (N, 3) frame-0 positions (used to compute relative offsets)
+
+    Returns:
+        offsets: (T, N, 3) float32 array
+    """
+    T = deformations_mesh.shape[0]
+    N = tri_indices.shape[0]
+
+    t_pos_idx = mesh.t_pos_idx.cpu().numpy()  # (F, 3)
+    v0_idx = t_pos_idx[tri_indices, 0]  # (N,)
+    v1_idx = t_pos_idx[tri_indices, 1]
+    v2_idx = t_pos_idx[tri_indices, 2]
     w0 = bary_coords[:, 0:1]  # (N, 1)
     w1 = bary_coords[:, 1:2]
     w2 = bary_coords[:, 2:3]
 
     offsets = np.zeros((T, N, 3), dtype=np.float32)
     for t in range(T):
-        def_verts = deformations_orig[t]   # (V_orig, 3)
-        pos_t = (w0 * def_verts[v0_idx]
-               + w1 * def_verts[v1_idx]
-               + w2 * def_verts[v2_idx])   # (N, 3)
+        verts = deformations_mesh[t]  # (V, 3)
+        pos_t = w0 * verts[v0_idx] + w1 * verts[v1_idx] + w2 * verts[v2_idx]  # (N, 3)
         offsets[t] = pos_t - pos_0
-
         if t % 10 == 0:
-            max_off = np.abs(offsets[t]).max()
-            print(f"  Frame {t}/{T}: max offset = {max_off:.4f}")
+            print(f"  Frame {t}/{T}: max offset = {np.abs(offsets[t]).max():.4f}")
 
     return offsets
+
+
+def compute_deformation_scale_factors(areas_all, max_areas_f, tri_indices):
+    """
+    Compute per-Gaussian per-frame scale factor = sqrt(area(f,t) / max_area(f)).
+
+    At the frame where face f hits its max area the factor is 1 (nominal scale);
+    at contracted frames the factor < 1, shrinking splats to avoid over-coverage.
+
+    Args:
+        areas_all:   (T, F) per-face areas at each frame
+        max_areas_f: (F,)  max area per face
+        tri_indices: (N,)  triangle index for each Gaussian
+
+    Returns:
+        scale_factors: (T, N) float32, values in (0, 1]
+    """
+    areas_g = areas_all[:, tri_indices]                             # (T, N)
+    max_areas_g = np.maximum(max_areas_f[tri_indices], 1e-12)       # (N,)
+    ratio = np.maximum(areas_g / max_areas_g, 1e-8)
+    return np.sqrt(ratio).astype(np.float32)
 
 
 def write_gaussians_ply(path, centroid, log_scale, quaternion, f_dc, opacity, num_sh_rest=45, num_obj_dc=16):
@@ -491,30 +559,50 @@ def main():
     print(f"  UV verts: {mesh.v_tex.shape[0]}, UV faces: {mesh.t_tex_idx.shape[0]}")
     print(f"  offset: {offset}, scale: {scale:.6f}")
 
-    # --- Sample Gaussians uniformly by surface area ---
-    print("\n--- Sampling surface Gaussians (frame 0) ---")
+    # --- Load deformations early to get max face areas for sampling ---
+    deformations_mesh = None
+    areas_all = None
+    max_areas_f = None
+    if os.path.exists(deformations_path):
+        print("\n--- Loading deformations ---")
+        deformations_mesh = load_deformations(mesh, deformations_path, offset, scale)
+        print("\n--- Computing face areas across all frames ---")
+        areas_all, max_areas_f = compute_face_areas(mesh, deformations_mesh)
+        print(f"  Max area range: [{max_areas_f.min():.6f}, {max_areas_f.max():.6f}]")
+        area_ratio = areas_all.max(axis=0) / np.maximum(areas_all[0], 1e-12)
+        print(f"  Max area-expansion ratio (any face): {area_ratio.max():.2f}x")
+    else:
+        print(f"\nNo deformations found at {deformations_path}, using frame-0 areas for sampling.")
+
+    # --- Sample Gaussians (weighted by max face area if available) ---
+    print("\n--- Sampling surface Gaussians ---")
     gaussians = sample_surface_gaussians(mesh, texture_np, sigma=args.sigma,
-                                         n_gaussians=args.n_gaussians, seed=args.seed)
+                                         n_gaussians=args.n_gaussians, seed=args.seed,
+                                         max_areas_f=max_areas_f)
     N = gaussians["centroid"].shape[0]
     print(f"  N Gaussians: {N}")
 
-    # --- Compute deformation offsets ---
+    # --- Compute deformation offsets and scale factors ---
     offsets = None
-    if os.path.exists(deformations_path):
+    scale_factors = None
+    if deformations_mesh is not None:
         print("\n--- Computing deformation offsets ---")
         offsets = compute_deformation_offsets(
             mesh,
-            deformations_path,
+            deformations_mesh,
             gaussians["tri_indices"],
             gaussians["bary_coords"],
             gaussians["centroid"],
-            offset,
-            scale,
         )
         print(f"  Offsets shape: {offsets.shape}")
         print(f"  Frame 0 max offset: {np.abs(offsets[0]).max():.6f} (should be ~0)")
-    else:
-        print(f"\nNo deformations found at {deformations_path}, skipping offset computation.")
+
+        print("\n--- Computing deformation scale factors ---")
+        scale_factors = compute_deformation_scale_factors(
+            areas_all, max_areas_f, gaussians["tri_indices"]
+        )
+        print(f"  Scale factors shape: {scale_factors.shape}")
+        print(f"  Scale factor range: [{scale_factors.min():.4f}, {scale_factors.max():.4f}]")
 
     # --- Write outputs ---
     print("\n--- Writing outputs ---")
@@ -536,10 +624,17 @@ def main():
         np.save(offsets_path, offsets.astype(np.float32))
         print(f"  Written: {offsets_path}")
 
+    if scale_factors is not None:
+        scales_path = os.path.join(gaussians_dir, "deformation_scales.npy")
+        np.save(scales_path, scale_factors.astype(np.float32))
+        print(f"  Written: {scales_path}")
+
     print(f"\nDone.")
     print(f"  N Gaussians: {N}")
     if offsets is not None:
         print(f"  Deformation offsets shape: {offsets.shape}")
+    if scale_factors is not None:
+        print(f"  Deformation scales shape: {scale_factors.shape}")
 
 
 if __name__ == "__main__":
