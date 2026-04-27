@@ -22,9 +22,11 @@ Usage:
 """
 
 import os
+import sys
 import argparse
 import numpy as np
 import torch
+import trimesh
 
 
 def parse_args():
@@ -88,13 +90,48 @@ def main():
 
     deformations_path = os.path.join(args.input_mesh, "deformations_vertices.npy")
     faces_path        = os.path.join(args.input_mesh, "deformations_faces.npy")
+    obj_path          = os.path.join(args.input_mesh, "texture", "mesh_00.obj")
     output_path       = os.path.join(args.input_mesh, "deformations_vertices_refined.npy")
 
     print(f"\nLoading deformations from {deformations_path}")
     deformations = np.load(deformations_path)   # (T, V, 3)
-    faces        = np.load(faces_path)           # (F, 3)
     T, V, _      = deformations.shape
-    print(f"  {T} frames, {V} vertices, {faces.shape[0]} faces")
+    print(f"  {T} frames, {V} vertices")
+
+    # Load face topology — prefer deformations_faces.npy, fall back to mesh_00.obj
+    if os.path.exists(faces_path):
+        faces = np.load(faces_path)   # (F, 3) indices into V
+        print(f"  Faces loaded from {faces_path}: {faces.shape[0]}")
+    else:
+        print(f"  deformations_faces.npy not found, loading topology from {obj_path}")
+        tm = trimesh.load(obj_path, process=False, force="mesh")
+        mesh_verts = np.array(tm.vertices, dtype=np.float32)  # (V_obj, 3)
+        mesh_faces = np.array(tm.faces,    dtype=np.int64)    # (F, 3)
+
+        # NN mapping: obj verts → deformation verts (frame 0 is in saved coord system)
+        # Deformation verts are saved as [-z, x, y] — undo to match obj space
+        def0 = deformations[0].copy()
+        def0_xyz = np.zeros_like(def0)
+        def0_xyz[:, 0] = def0[:, 1]
+        def0_xyz[:, 1] = def0[:, 2]
+        def0_xyz[:, 2] = -def0[:, 0]
+
+        device_cpu = "cuda" if torch.cuda.is_available() else "cpu"
+        v_obj  = torch.from_numpy(mesh_verts).float().to(device_cpu)
+        v_def  = torch.from_numpy(def0_xyz).float().to(device_cpu)
+        dists  = torch.cdist(v_obj.unsqueeze(0), v_def.unsqueeze(0)).squeeze(0)
+        _, nn  = torch.min(dists, dim=1)
+        nn_np  = nn.cpu().numpy()  # (V_obj,) maps obj vert → deformation vert
+
+        avg_d = dists.min(dim=1).values.mean().item()
+        print(f"  NN mapping avg distance: {avg_d:.6f}")
+        if avg_d > 1e-3:
+            print("  WARNING: High avg distance — face indices may be inaccurate.")
+
+        faces = nn_np[mesh_faces]   # (F, 3) indices into deformation verts
+        print(f"  Faces remapped: {faces.shape[0]}")
+
+    print(f"  Total: {T} frames, {V} verts, {faces.shape[0]} faces")
 
     print("\nBuilding edges...")
     edges = get_edges(faces)
