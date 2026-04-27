@@ -83,6 +83,11 @@ def parse_args():
         "--seed", type=int, default=0,
         help="Random seed for surface sampling (default: 0)."
     )
+    parser.add_argument(
+        "--max_area_ratio", type=float, default=20.0,
+        help="Faces whose max/median area ratio exceeds this are treated as degenerate "
+             "(e.g. vertex-swap artifacts) and receive no Gaussians (default: 20.0)."
+    )
     return parser.parse_args()
 
 
@@ -659,8 +664,20 @@ def main():
         print("\n--- Computing face areas across all frames ---")
         areas_all, max_areas_f = compute_face_areas(mesh, deformations_mesh)
         print(f"  Max area range: [{max_areas_f.min():.6f}, {max_areas_f.max():.6f}]")
-        area_ratio = areas_all.max(axis=0) / np.maximum(areas_all[0], 1e-12)
-        print(f"  Max area-expansion ratio (any face): {area_ratio.max():.2f}x")
+
+        # --- Prune degenerate faces (vertex-swap artifacts) ---
+        median_areas_f = np.median(areas_all, axis=0)  # (F,)
+        ratio = max_areas_f / np.maximum(median_areas_f, 1e-12)
+        degenerate_mask = ratio > args.max_area_ratio
+        n_degen = int(degenerate_mask.sum())
+        print(f"  Max/median area ratio — max: {ratio.max():.1f}x, "
+              f"faces above {args.max_area_ratio}x threshold: {n_degen} / {len(ratio)}")
+        if n_degen > 0:
+            max_areas_f = max_areas_f.copy()
+            max_areas_f[degenerate_mask] = 0.0
+            areas_all = areas_all.copy()
+            areas_all[:, degenerate_mask] = 0.0
+            print(f"  Zeroed out {n_degen} degenerate faces — they will receive no Gaussians.")
     else:
         print(f"\nNo deformations found at {deformations_path}, using frame-0 areas for sampling.")
 
