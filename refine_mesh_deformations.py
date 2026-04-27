@@ -91,6 +91,41 @@ def print_edge_stretch_stats(deformations, edges):
           f"edges >3x: {int((max_stretch > 3).sum())}")
 
 
+def compute_vertex_weights(deformations, edges, alpha):
+    """
+    Per-vertex weight w = 1 / max_stretch^alpha.
+
+    max_stretch is the maximum edge stretch ratio (current/rest length) across
+    all incident edges and all frames. Stable vertices get w≈1 (anchor to
+    original positions); jumped vertices get w≈0 (anchor to previous frame).
+    """
+    T, V, _ = deformations.shape
+    E = edges.shape[0]
+    ei, ej = edges[:, 0], edges[:, 1]
+
+    pos_0        = deformations[0]
+    rest_lengths = np.maximum(
+        np.linalg.norm(pos_0[ei] - pos_0[ej], axis=-1), 1e-8
+    )
+
+    max_stretch_per_edge = np.ones(E, dtype=np.float32)
+    for t in range(T):
+        pos_t   = deformations[t]
+        lengths = np.linalg.norm(pos_t[ei] - pos_t[ej], axis=-1)
+        np.maximum(max_stretch_per_edge, lengths / rest_lengths, out=max_stretch_per_edge)
+
+    max_stretch_per_vertex = np.ones(V, dtype=np.float32)
+    np.maximum.at(max_stretch_per_vertex, ei, max_stretch_per_edge)
+    np.maximum.at(max_stretch_per_vertex, ej, max_stretch_per_edge)
+
+    weights = (1.0 / np.maximum(max_stretch_per_vertex, 1.0) ** alpha).astype(np.float32)
+
+    print(f"  Vertex weights — min: {weights.min():.4f}, "
+          f"median: {np.median(weights):.4f}, "
+          f"vertices below 0.1: {int((weights < 0.1).sum())} / {V}")
+    return weights
+
+
 def main():
     args = parse_args()
 
