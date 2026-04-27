@@ -43,9 +43,9 @@ def parse_args():
     parser.add_argument("--data_weight", type=float, default=50.0,
                         help="Weight anchoring stable vertices to original positions "
                              "(default: 50.0).")
-    parser.add_argument("--jump_threshold", type=float, default=5.0,
-                        help="Vertices whose max frame-to-frame displacement exceeds "
-                             "this multiple of the median get weight≈0 (default: 5.0).")
+    parser.add_argument("--jump_threshold", type=float, default=3.0,
+                        help="Vertices whose max incident edge stretch exceeds this "
+                             "ratio (current/rest length) get weight≈0 (default: 3.0).")
     return parser.parse_args()
 
 
@@ -60,28 +60,50 @@ def get_edges(faces_np):
     return np.unique(all_edges, axis=0).astype(np.int64)
 
 
-def compute_vertex_weights(deformations, jump_threshold):
+def compute_vertex_weights(deformations, edges, jump_threshold):
     """
     Per-vertex anchor weight: 1.0 for stable vertices, ~0.0 for jumping ones.
 
-    A vertex is considered jumping if its max frame-to-frame displacement exceeds
-    jump_threshold × median displacement across all vertices.
+    Uses the maximum edge stretch ratio (current_length / rest_length) across
+    all incident edges and all frames. A vertex that teleports to the wrong limb
+    will have at least one drastically stretched edge, clearly distinguishing it
+    from vertices with merely large but legitimate motion.
+
+    jump_threshold: edge stretch ratio above which a vertex gets weight≈0.
     """
     T, V, _ = deformations.shape
-    frame_disps = np.linalg.norm(np.diff(deformations, axis=0), axis=-1)  # (T-1, V)
-    max_disp = frame_disps.max(axis=0)  # (V,)
+    E = edges.shape[0]
+    ei, ej = edges[:, 0], edges[:, 1]
 
-    med = np.median(max_disp)
-    ratio = max_disp / max(med, 1e-8)
+    pos_0        = deformations[0]
+    rest_lengths = np.maximum(
+        np.linalg.norm(pos_0[ei] - pos_0[ej], axis=-1), 1e-8
+    )  # (E,)
 
-    # Smooth falloff: ratio < 1 → weight=1, ratio > jump_threshold → weight≈0
-    weights = 1.0 / (1.0 + np.maximum(ratio - 1.0, 0.0) ** 2
-                         / max((jump_threshold - 1.0) ** 2, 1e-8))
+    # Max edge stretch ratio across all frames
+    max_stretch_per_edge = np.ones(E, dtype=np.float32)
+    for t in range(T):
+        pos_t    = deformations[t]
+        lengths  = np.linalg.norm(pos_t[ei] - pos_t[ej], axis=-1)
+        stretch  = lengths / rest_lengths
+        np.maximum(max_stretch_per_edge, stretch, out=max_stretch_per_edge)
+
+    # Per-vertex: max stretch over all incident edges
+    max_stretch_per_vertex = np.ones(V, dtype=np.float32)
+    np.maximum.at(max_stretch_per_vertex, ei, max_stretch_per_edge)
+    np.maximum.at(max_stretch_per_vertex, ej, max_stretch_per_edge)
+
+    print(f"  Edge stretch — max: {max_stretch_per_edge.max():.1f}x, "
+          f"median: {np.median(max_stretch_per_edge):.2f}x")
+
+    # Smooth falloff: stretch < threshold → weight≈1, stretch > threshold → weight≈0
+    excess = np.maximum(max_stretch_per_vertex - jump_threshold, 0.0)
+    weights = 1.0 / (1.0 + (excess / max(jump_threshold * 0.5, 1e-8)) ** 2)
     weights = weights.astype(np.float32)
 
     n_low = int((weights < 0.1).sum())
     print(f"  Vertices with weight < 0.1 (jumping): {n_low} / {V}  "
-          f"(max ratio: {ratio.max():.1f}x, threshold: {jump_threshold}x)")
+          f"(threshold: {jump_threshold}x stretch)")
     return weights
 
 
@@ -150,7 +172,7 @@ def main():
 
     # Per-vertex anchor weights
     print("\nComputing vertex weights...")
-    weights   = compute_vertex_weights(deformations, args.jump_threshold)
+    weights   = compute_vertex_weights(deformations, edges, args.jump_threshold)
     weights_t = torch.from_numpy(weights).float().to(device).unsqueeze(1)  # (V, 1)
 
     # Optimise each frame
