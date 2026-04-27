@@ -3,21 +3,26 @@ refine_mesh_deformations.py — Fix vertex-swap artifacts in ActionMesh deformat
 
 Some vertices in the ActionMesh output get misassigned to the wrong limb in later
 frames, causing edges to become anomalously long and erroneous bridging faces to
-appear. This script fixes that by optimising per-frame vertex positions to:
+appear.
 
-  1. Preserve rest-pose (frame 0) edge lengths as closely as possible.
-  2. Anchor well-behaved vertices (small frame-to-frame displacement) to their
-     original positions.
+Strategy: sequential (causal) optimisation.
 
-Jumping vertices (detected by anomalously large frame-to-frame displacement) get
-a near-zero anchor weight and are repositioned by the edge length constraint alone,
-pulling them back into their correct neighbourhood.
+Each frame t is initialised from the PREVIOUS refined frame (t-1) rather than
+from the original (potentially jumped) positions. A jumped vertex therefore starts
+on the correct side and only needs the edge-length loss to follow natural motion.
+A small temporal anchor (--temporal_weight) prevents the optimizer from straying
+far from the previous frame, but is weak enough to allow genuine corgi motion.
+
+Loss per frame:
+  edge_loss     = mean( (current_edge_lengths - rest_edge_lengths)^2 )
+  temporal_loss = mean( (pos - prev_refined)^2 )
+  total = edge_weight * edge_loss + temporal_weight * temporal_loss
 
 Output: <input_mesh>/deformations_vertices_refined.npy  (T, V, 3)
 
 Usage:
-  python refine_mesh_deformations.py \
-    --input_mesh output/2026.03.03/actionmesh_gs_replace_corgi \
+  python refine_mesh_deformations.py \\
+    --input_mesh output/2026.03.03/actionmesh_gs_replace_corgi \\
     --n_steps 300
 """
 
@@ -40,13 +45,10 @@ def parse_args():
                         help="Adam learning rate (default: 5e-4).")
     parser.add_argument("--edge_weight", type=float, default=1.0,
                         help="Weight for edge length preservation loss (default: 1.0).")
-    parser.add_argument("--data_weight", type=float, default=50.0,
-                        help="Weight anchoring stable vertices to original positions "
-                             "(default: 50.0).")
-    parser.add_argument("--alpha", type=float, default=2.0,
-                        help="Exponent for adaptive data weight: weight = 1/stretch^alpha. "
-                             "Higher values more aggressively free up distorted vertices "
-                             "(default: 2.0).")
+    parser.add_argument("--temporal_weight", type=float, default=1.0,
+                        help="Weight anchoring each frame to the previous refined frame "
+                             "(default: 1.0). Prevents large jumps while allowing natural "
+                             "motion.")
     return parser.parse_args()
 
 
@@ -61,52 +63,23 @@ def get_edges(faces_np):
     return np.unique(all_edges, axis=0).astype(np.int64)
 
 
-def compute_vertex_weights(deformations, edges, alpha):
-    """
-    Per-vertex anchor weight using a smooth inverse stretch relationship:
-
-        weight_v = 1 / max_stretch_v ^ alpha
-
-    where max_stretch_v is the maximum edge stretch ratio (current/rest length)
-    across all incident edges and all frames. No threshold needed — the stretch
-    value itself continuously determines how free each vertex is to move.
-
-    alpha: exponent controlling falloff aggressiveness.
-           alpha=1: linear (stretch=2x → weight=0.5)
-           alpha=2: quadratic (stretch=2x → weight=0.25)
-    """
+def print_edge_stretch_stats(deformations, edges):
+    """Diagnostic: report edge stretch stats across all frames."""
     T, V, _ = deformations.shape
-    E = edges.shape[0]
     ei, ej = edges[:, 0], edges[:, 1]
-
     pos_0        = deformations[0]
     rest_lengths = np.maximum(
         np.linalg.norm(pos_0[ei] - pos_0[ej], axis=-1), 1e-8
-    )  # (E,)
-
-    # Max edge stretch ratio across all frames
-    max_stretch_per_edge = np.ones(E, dtype=np.float32)
+    )
+    max_stretch = np.ones(edges.shape[0], dtype=np.float32)
     for t in range(T):
         pos_t   = deformations[t]
         lengths = np.linalg.norm(pos_t[ei] - pos_t[ej], axis=-1)
-        stretch = lengths / rest_lengths
-        np.maximum(max_stretch_per_edge, stretch, out=max_stretch_per_edge)
-
-    # Per-vertex: max stretch over all incident edges
-    max_stretch_per_vertex = np.ones(V, dtype=np.float32)
-    np.maximum.at(max_stretch_per_vertex, ei, max_stretch_per_edge)
-    np.maximum.at(max_stretch_per_vertex, ej, max_stretch_per_edge)
-
-    print(f"  Edge stretch — max: {max_stretch_per_edge.max():.1f}x, "
-          f"median: {np.median(max_stretch_per_edge):.2f}x, "
-          f"95th pct: {np.percentile(max_stretch_per_edge, 95):.2f}x")
-
-    weights = (1.0 / np.maximum(max_stretch_per_vertex, 1.0) ** alpha).astype(np.float32)
-
-    print(f"  Vertex weights — min: {weights.min():.4f}, "
-          f"median: {np.median(weights):.4f}, "
-          f"vertices below 0.1: {int((weights < 0.1).sum())} / {V}")
-    return weights
+        np.maximum(max_stretch, lengths / rest_lengths, out=max_stretch)
+    print(f"  Edge stretch (original) — max: {max_stretch.max():.1f}x, "
+          f"median: {np.median(max_stretch):.2f}x, "
+          f"95th pct: {np.percentile(max_stretch, 95):.2f}x, "
+          f"edges >3x: {int((max_stretch > 3).sum())}")
 
 
 def main():
@@ -165,6 +138,9 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"  Device: {device}")
 
+    print("\nEdge stretch diagnostics (original deformations)...")
+    print_edge_stretch_stats(deformations, edges)
+
     edges_t  = torch.from_numpy(edges).long().to(device)
     ei, ej   = edges_t[:, 0], edges_t[:, 1]
 
@@ -172,29 +148,25 @@ def main():
     pos_0        = torch.from_numpy(deformations[0]).float().to(device)
     rest_lengths = torch.norm(pos_0[ei] - pos_0[ej], dim=1)  # (E,)
 
-    # Per-vertex anchor weights
-    print("\nComputing vertex weights...")
-    weights   = compute_vertex_weights(deformations, edges, args.alpha)
-    weights_t = torch.from_numpy(weights).float().to(device).unsqueeze(1)  # (V, 1)
-
-    # Optimise each frame
-    print(f"\nRefining {T-1} frames  "
+    # Sequential optimisation: each frame initialised from previous refined frame
+    print(f"\nRefining {T-1} frames sequentially  "
           f"({args.n_steps} steps, lr={args.lr}, "
-          f"edge_weight={args.edge_weight}, data_weight={args.data_weight})")
+          f"edge_weight={args.edge_weight}, temporal_weight={args.temporal_weight})")
     refined    = np.zeros_like(deformations)
     refined[0] = deformations[0]   # frame 0 is the rest pose — keep unchanged
 
     for t in range(1, T):
-        pos_orig = torch.from_numpy(deformations[t]).float().to(device)
-        pos      = pos_orig.clone().requires_grad_(True)
+        # Initialise from previous refined frame (not the original jumped positions)
+        pos_prev = torch.from_numpy(refined[t-1]).float().to(device)
+        pos      = pos_prev.clone().requires_grad_(True)
         opt      = torch.optim.Adam([pos], lr=args.lr)
 
         for _ in range(args.n_steps):
             opt.zero_grad()
-            lengths   = torch.norm(pos[ei] - pos[ej], dim=1)
-            edge_loss = ((lengths - rest_lengths) ** 2).mean()
-            data_loss = (weights_t * (pos - pos_orig) ** 2).mean()
-            loss      = args.edge_weight * edge_loss + args.data_weight * data_loss
+            lengths       = torch.norm(pos[ei] - pos[ej], dim=1)
+            edge_loss     = ((lengths - rest_lengths) ** 2).mean()
+            temporal_loss = ((pos - pos_prev) ** 2).mean()
+            loss          = args.edge_weight * edge_loss + args.temporal_weight * temporal_loss
             loss.backward()
             opt.step()
 
@@ -202,7 +174,7 @@ def main():
 
         if t % 10 == 0 or t == T - 1:
             print(f"  Frame {t:3d}/{T-1}  "
-                  f"edge={edge_loss.item():.2e}  data={data_loss.item():.2e}")
+                  f"edge={edge_loss.item():.2e}  temporal={temporal_loss.item():.2e}")
 
     np.save(output_path, refined.astype(np.float32))
     print(f"\nSaved refined deformations: {output_path}")
