@@ -113,7 +113,7 @@ def main():
 
     # --- Cameras ---
     cameras = get_orthogonal_camera(
-        elevation_deg=0.0, distance=2.2,
+        elevation_deg=[0] * 4, distance=[2.2] * 4,
         left=-0.55, right=0.55, bottom=-0.55, top=0.55,
         azimuth_deg=[-90, 0, 90, 180],
         device=device,
