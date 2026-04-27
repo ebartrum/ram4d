@@ -43,9 +43,10 @@ def parse_args():
     parser.add_argument("--data_weight", type=float, default=50.0,
                         help="Weight anchoring stable vertices to original positions "
                              "(default: 50.0).")
-    parser.add_argument("--jump_threshold", type=float, default=3.0,
-                        help="Vertices whose max incident edge stretch exceeds this "
-                             "ratio (current/rest length) get weight≈0 (default: 3.0).")
+    parser.add_argument("--alpha", type=float, default=2.0,
+                        help="Exponent for adaptive data weight: weight = 1/stretch^alpha. "
+                             "Higher values more aggressively free up distorted vertices "
+                             "(default: 2.0).")
     return parser.parse_args()
 
 
@@ -60,16 +61,19 @@ def get_edges(faces_np):
     return np.unique(all_edges, axis=0).astype(np.int64)
 
 
-def compute_vertex_weights(deformations, edges, jump_threshold):
+def compute_vertex_weights(deformations, edges, alpha):
     """
-    Per-vertex anchor weight: 1.0 for stable vertices, ~0.0 for jumping ones.
+    Per-vertex anchor weight using a smooth inverse stretch relationship:
 
-    Uses the maximum edge stretch ratio (current_length / rest_length) across
-    all incident edges and all frames. A vertex that teleports to the wrong limb
-    will have at least one drastically stretched edge, clearly distinguishing it
-    from vertices with merely large but legitimate motion.
+        weight_v = 1 / max_stretch_v ^ alpha
 
-    jump_threshold: edge stretch ratio above which a vertex gets weight≈0.
+    where max_stretch_v is the maximum edge stretch ratio (current/rest length)
+    across all incident edges and all frames. No threshold needed — the stretch
+    value itself continuously determines how free each vertex is to move.
+
+    alpha: exponent controlling falloff aggressiveness.
+           alpha=1: linear (stretch=2x → weight=0.5)
+           alpha=2: quadratic (stretch=2x → weight=0.25)
     """
     T, V, _ = deformations.shape
     E = edges.shape[0]
@@ -83,9 +87,9 @@ def compute_vertex_weights(deformations, edges, jump_threshold):
     # Max edge stretch ratio across all frames
     max_stretch_per_edge = np.ones(E, dtype=np.float32)
     for t in range(T):
-        pos_t    = deformations[t]
-        lengths  = np.linalg.norm(pos_t[ei] - pos_t[ej], axis=-1)
-        stretch  = lengths / rest_lengths
+        pos_t   = deformations[t]
+        lengths = np.linalg.norm(pos_t[ei] - pos_t[ej], axis=-1)
+        stretch = lengths / rest_lengths
         np.maximum(max_stretch_per_edge, stretch, out=max_stretch_per_edge)
 
     # Per-vertex: max stretch over all incident edges
@@ -94,16 +98,14 @@ def compute_vertex_weights(deformations, edges, jump_threshold):
     np.maximum.at(max_stretch_per_vertex, ej, max_stretch_per_edge)
 
     print(f"  Edge stretch — max: {max_stretch_per_edge.max():.1f}x, "
-          f"median: {np.median(max_stretch_per_edge):.2f}x")
+          f"median: {np.median(max_stretch_per_edge):.2f}x, "
+          f"95th pct: {np.percentile(max_stretch_per_edge, 95):.2f}x")
 
-    # Smooth falloff: stretch < threshold → weight≈1, stretch > threshold → weight≈0
-    excess = np.maximum(max_stretch_per_vertex - jump_threshold, 0.0)
-    weights = 1.0 / (1.0 + (excess / max(jump_threshold * 0.5, 1e-8)) ** 2)
-    weights = weights.astype(np.float32)
+    weights = (1.0 / np.maximum(max_stretch_per_vertex, 1.0) ** alpha).astype(np.float32)
 
-    n_low = int((weights < 0.1).sum())
-    print(f"  Vertices with weight < 0.1 (jumping): {n_low} / {V}  "
-          f"(threshold: {jump_threshold}x stretch)")
+    print(f"  Vertex weights — min: {weights.min():.4f}, "
+          f"median: {np.median(weights):.4f}, "
+          f"vertices below 0.1: {int((weights < 0.1).sum())} / {V}")
     return weights
 
 
@@ -172,7 +174,7 @@ def main():
 
     # Per-vertex anchor weights
     print("\nComputing vertex weights...")
-    weights   = compute_vertex_weights(deformations, edges, args.jump_threshold)
+    weights   = compute_vertex_weights(deformations, edges, args.alpha)
     weights_t = torch.from_numpy(weights).float().to(device).unsqueeze(1)  # (V, 1)
 
     # Optimise each frame
