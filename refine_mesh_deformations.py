@@ -5,18 +5,19 @@ Some vertices in the ActionMesh output get misassigned to the wrong limb in late
 frames, causing edges to become anomalously long and erroneous bridging faces to
 appear.
 
-Strategy: sequential (causal) optimisation.
+Strategy: complementary per-vertex anchoring.
 
-Each frame t is initialised from the PREVIOUS refined frame (t-1) rather than
-from the original (potentially jumped) positions. A jumped vertex therefore starts
-on the correct side and only needs the edge-length loss to follow natural motion.
-A small temporal anchor (--temporal_weight) prevents the optimizer from straying
-far from the previous frame, but is weak enough to allow genuine corgi motion.
+Each vertex has an adaptive weight w = 1 / stretch^alpha, where stretch is the
+maximum edge stretch ratio (current/rest length) across all frames:
+  - Stable vertex (stretch ≈ 1, w ≈ 1): anchored to deformations[t]  (correct)
+  - Jumped vertex  (stretch >> 1, w ≈ 0): anchored to refined[t-1]   (correct)
 
 Loss per frame:
   edge_loss     = mean( (current_edge_lengths - rest_edge_lengths)^2 )
-  temporal_loss = mean( (pos - prev_refined)^2 )
-  total = edge_weight * edge_loss + temporal_weight * temporal_loss
+  data_loss     = mean( w     * (pos - deformations[t])^2 )
+  temporal_loss = mean( (1-w) * (pos - refined[t-1])^2 )
+  total = edge_weight * edge_loss + data_weight * data_loss
+                                  + temporal_weight * temporal_loss
 
 Output: <input_mesh>/deformations_vertices_refined.npy  (T, V, 3)
 
@@ -45,10 +46,18 @@ def parse_args():
                         help="Adam learning rate (default: 5e-4).")
     parser.add_argument("--edge_weight", type=float, default=1.0,
                         help="Weight for edge length preservation loss (default: 1.0).")
-    parser.add_argument("--temporal_weight", type=float, default=1.0,
-                        help="Weight anchoring each frame to the previous refined frame "
-                             "(default: 1.0). Prevents large jumps while allowing natural "
-                             "motion.")
+    parser.add_argument("--data_weight", type=float, default=50.0,
+                        help="Weight for per-vertex anchor losses (both data and temporal "
+                             "terms share this scale, split by w and 1-w respectively). "
+                             "(default: 50.0).")
+    parser.add_argument("--temporal_weight", type=float, default=50.0,
+                        help="Weight for the temporal (previous-frame) anchor on jumped "
+                             "vertices. Should be similar magnitude to --data_weight. "
+                             "(default: 50.0).")
+    parser.add_argument("--alpha", type=float, default=2.0,
+                        help="Exponent for adaptive weight: w = 1/stretch^alpha. "
+                             "Higher values more aggressively redirect distorted vertices "
+                             "to the previous frame (default: 2.0).")
     return parser.parse_args()
 
 
@@ -148,25 +157,37 @@ def main():
     pos_0        = torch.from_numpy(deformations[0]).float().to(device)
     rest_lengths = torch.norm(pos_0[ei] - pos_0[ej], dim=1)  # (E,)
 
-    # Sequential optimisation: each frame initialised from previous refined frame
-    print(f"\nRefining {T-1} frames sequentially  "
+    # Per-vertex weights: w = 1/stretch^alpha
+    # Stable vertices (w≈1) anchor to deformations[t]; jumped vertices (w≈0) anchor to refined[t-1]
+    print("\nComputing per-vertex weights...")
+    weights   = compute_vertex_weights(deformations, edges, args.alpha)
+    w_t       = torch.from_numpy(weights).float().to(device).unsqueeze(1)   # (V, 1)
+    one_minus_w_t = 1.0 - w_t
+
+    # Optimise each frame
+    print(f"\nRefining {T-1} frames  "
           f"({args.n_steps} steps, lr={args.lr}, "
-          f"edge_weight={args.edge_weight}, temporal_weight={args.temporal_weight})")
+          f"edge_weight={args.edge_weight}, "
+          f"data_weight={args.data_weight}, temporal_weight={args.temporal_weight})")
     refined    = np.zeros_like(deformations)
     refined[0] = deformations[0]   # frame 0 is the rest pose — keep unchanged
 
     for t in range(1, T):
-        # Initialise from previous refined frame (not the original jumped positions)
-        pos_prev = torch.from_numpy(refined[t-1]).float().to(device)
-        pos      = pos_prev.clone().requires_grad_(True)
+        pos_orig = torch.from_numpy(deformations[t]).float().to(device)   # original (may be wrong)
+        pos_prev = torch.from_numpy(refined[t-1]).float().to(device)      # previous refined frame
+        pos      = pos_orig.clone().requires_grad_(True)
         opt      = torch.optim.Adam([pos], lr=args.lr)
 
         for _ in range(args.n_steps):
             opt.zero_grad()
             lengths       = torch.norm(pos[ei] - pos[ej], dim=1)
             edge_loss     = ((lengths - rest_lengths) ** 2).mean()
-            temporal_loss = ((pos - pos_prev) ** 2).mean()
-            loss          = args.edge_weight * edge_loss + args.temporal_weight * temporal_loss
+            # Stable verts (w≈1) anchor to original; jumped verts (w≈0) anchor to prev frame
+            data_loss     = (w_t           * (pos - pos_orig) ** 2).mean()
+            temporal_loss = (one_minus_w_t * (pos - pos_prev) ** 2).mean()
+            loss = (args.edge_weight  * edge_loss
+                    + args.data_weight     * data_loss
+                    + args.temporal_weight * temporal_loss)
             loss.backward()
             opt.step()
 
@@ -174,7 +195,9 @@ def main():
 
         if t % 10 == 0 or t == T - 1:
             print(f"  Frame {t:3d}/{T-1}  "
-                  f"edge={edge_loss.item():.2e}  temporal={temporal_loss.item():.2e}")
+                  f"edge={edge_loss.item():.2e}  "
+                  f"data={data_loss.item():.2e}  "
+                  f"temporal={temporal_loss.item():.2e}")
 
     np.save(output_path, refined.astype(np.float32))
     print(f"\nSaved refined deformations: {output_path}")
