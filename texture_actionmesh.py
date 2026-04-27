@@ -30,9 +30,11 @@ from PIL import Image
 from torchvision import transforms
 import imageio
 
-from visualise_output import TextureGenerator, apply_mesh_transforms
-from mvadapter.utils import make_image_grid
-from mvadapter.utils.mesh_utils import load_mesh, get_orthogonal_camera, render
+from visualise_output import TextureGenerator
+from mvadapter.utils.mesh_utils import load_mesh, get_orthogonal_camera
+from mesh_render_utils import (load_and_transform_deformations,
+                                compute_vertex_mapping,
+                                render_dynamic_mesh_video)
 
 
 REQUIRED_CHECKPOINTS = {
@@ -164,74 +166,28 @@ def main():
 
     # Step 3: Dynamic rendering
     print("\n--- Step 3: Dynamic textured mesh rendering ---")
-    deformations = np.load(deformations_path)  # (T, V, 3)
-    print(f"Loaded deformations: shape {deformations.shape}")
+    deformations_orig = load_and_transform_deformations(deformations_path, offset, scale)
+    print(f"  Deformations: {deformations_orig.shape}")
 
-    # Undo save_deformation transform: saved as [-z, x, y] -> restore [x, y, z]
-    deformations_orig = []
-    for i in range(deformations.shape[0]):
-        verts = deformations[i].copy()
-        v_restored = np.zeros_like(verts)
-        v_restored[:, 0] = verts[:, 1]
-        v_restored[:, 1] = verts[:, 2]
-        v_restored[:, 2] = -verts[:, 0]
-        verts = apply_mesh_transforms(v_restored, offset, scale, front_x_to_y=True)
-        deformations_orig.append(verts)
-    deformations_orig = np.array(deformations_orig)  # (T, V_orig, 3)
-
-    # Compute nearest-neighbour mapping: textured mesh verts -> original mesh verts
-    print("Computing vertex mapping (textured -> original)...")
-    v_tex_tensor = mesh_textured.v_pos  # (V_tex, 3)
-    v_orig_tensor = torch.from_numpy(deformations_orig[0]).float().to(device)  # (V_orig, 3)
-
-    dist_matrix = torch.cdist(v_tex_tensor.unsqueeze(0), v_orig_tensor.unsqueeze(0)).squeeze(0)
-    min_dist, mapping_idx = torch.min(dist_matrix, dim=1)
-    avg_dist = torch.mean(min_dist).item()
-    print(f"Mapping computed. Avg distance: {avg_dist:.6f}")
-    if avg_dist > 1e-4:
-        print("WARNING: High average distance — possible misalignment between mesh and deformations.")
+    mapping_idx = compute_vertex_mapping(mesh_textured.v_pos, deformations_orig[0], device)
 
     # Load input frames for side-by-side grid
     input_frames = []
+    T = deformations_orig.shape[0]
     frame_files = sorted(f for f in os.listdir(source_dir) if f.endswith(".png"))
-    for fname in frame_files[:deformations.shape[0]]:
+    for fname in frame_files[:T]:
         img = Image.open(os.path.join(source_dir, fname)).convert("RGB").resize((768, 768))
         input_frames.append(img)
-    if len(input_frames) < deformations.shape[0]:
+    if len(input_frames) < T:
         pad = input_frames[-1] if input_frames else Image.new("RGB", (768, 768))
-        input_frames.extend([pad] * (deformations.shape[0] - len(input_frames)))
+        input_frames.extend([pad] * (T - len(input_frames)))
 
-    # Render loop
-    video_frames = []
-    n_frames = deformations.shape[0]
-    for i in range(n_frames):
-        verts_orig = torch.from_numpy(deformations_orig[i]).float().to(device)
-        verts_tex = verts_orig[mapping_idx]
-        mesh_textured.v_pos = verts_tex
-        mesh_textured._v_nrm = None
-        mesh_textured._v_tang = None
-        mesh_textured._stitched_v_pos = None
-
-        render_out = render(
-            generator.texture_pipe.ctx,
-            mesh_textured,
-            cameras,
-            height=768,
-            width=768,
-            render_attr=True,
-            render_depth=False,
-            render_normal=False,
-        )
-
-        frame_images = render_out.attr.clamp(0, 1).cpu().permute(0, 3, 1, 2)
-        frame_pils = [transforms.ToPILImage()(img) for img in frame_images]
-        frame_pils.insert(0, input_frames[i])  # prepend input frame
-
-        grid_img = make_image_grid(frame_pils, rows=1)
-        video_frames.append(np.array(grid_img))
-
-        if i % 5 == 0:
-            print(f"Rendered frame {i}/{n_frames}")
+    video_frames = render_dynamic_mesh_video(
+        generator.texture_pipe.ctx, mesh_textured, cameras,
+        deformations_orig, mapping_idx,
+        height=768, width=768,
+        prefix_frames=input_frames,
+    )
 
     video_path = os.path.join(texture_dir, "textured_dynamic_mesh.mp4")
     imageio.mimsave(video_path, video_frames, fps=args.fps)

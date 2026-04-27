@@ -84,6 +84,12 @@ def parse_args():
         help="Random seed for surface sampling (default: 0)."
     )
     parser.add_argument(
+        "--deformations_path", type=str, default=None,
+        help="Override path to deformations_vertices.npy "
+             "(default: <input_mesh>/deformations_vertices.npy). "
+             "Use this to pass refined deformations from refine_mesh_deformations.py."
+    )
+    parser.add_argument(
         "--max_area_ratio", type=float, default=20.0,
         help="Faces whose max/median area ratio exceeds this are treated as degenerate "
              "(e.g. vertex-swap artifacts) and receive no Gaussians (default: 20.0)."
@@ -620,7 +626,7 @@ def main():
     args = parse_args()
     input_mesh = args.input_mesh
     texture_dir = os.path.join(input_mesh, "texture")
-    deformations_path = os.path.join(input_mesh, "deformations_vertices.npy")
+    deformations_path = args.deformations_path or os.path.join(input_mesh, "deformations_vertices.npy")
     gaussians_dir = args.output_dir
 
     # --- Load texture image ---
