@@ -16,3 +16,6 @@
 [submodule "Wan-Move"]
 	path = Wan-Move
 	url = git@github.com:ebartrum/Wan-Move.git
+[submodule "FlashWorld"]
+	path = FlashWorld
+	url = https://github.com/imlixinyang/FlashWorld.git
